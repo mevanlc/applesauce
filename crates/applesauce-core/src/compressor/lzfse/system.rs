@@ -7,6 +7,8 @@ pub enum Impl {}
 const ALGORITHM: bindings::compression_algorithm =
     bindings::compression_algorithm::COMPRESSION_LZFSE;
 
+// SAFETY: This type has no data and only provides algorithm-specific compression implementation
+// details; it is valid to mark it as a safe impl target for the required trait contract.
 unsafe impl lz::Impl for Impl {
     fn scratch_size() -> usize {
         // SAFETY: Both of these functions are always safe to call

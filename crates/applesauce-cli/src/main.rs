@@ -286,25 +286,7 @@ fn main() {
                             continue;
                         }
                     };
-                    println!("\n{}:", path.display());
-
-                    println!("Number of compressed files: {}", info.num_compressed_files);
-                    println!("Total number of files: {}", info.num_files);
-                    println!("Total number of folders: {}", info.num_folders);
-                    println!(
-                        "Total uncompressed size: {} ({})",
-                        format_bytes(info.total_uncompressed_size),
-                        info.total_uncompressed_size
-                    );
-                    println!(
-                        "Total compressed size: {} ({})",
-                        format_bytes(info.total_compressed_size),
-                        info.total_compressed_size
-                    );
-                    println!(
-                        "Compression Savings: {:.1}%",
-                        info.compression_savings_fraction() * 100.0,
-                    );
+                    display_folder_info(&path, &info);
                 } else {
                     let info = info::get(&path);
                     let info = match info {
@@ -318,50 +300,111 @@ fn main() {
                             continue;
                         }
                     };
-                    if info.is_compressed {
-                        println!("{} is compressed", path.display());
-                    } else {
-                        println!("{} is not compressed", path.display());
-                    }
-
-                    match &info.decmpfs_info {
-                        Some(Ok(decmpfs_info)) => {
-                            println!("Compression type: {}", decmpfs_info.compression_type);
-                            println!(
-                                "Uncompressed size in decmpfs xattr: {}",
-                                decmpfs_info.orig_file_size
-                            );
-                        }
-                        Some(Err(decmpfs_err)) => {
-                            if info.is_compressed {
-                                tracing::error!(
-                                    "compressed file has issue with decompfs xattr: {}",
-                                    decmpfs_err
-                                );
-                            }
-                        }
-                        None => {
-                            if info.is_compressed {
-                                tracing::error!("compressed file has no decmpfs xattr");
-                            }
-                        }
-                    }
-                    println!("Uncompressed size: {}", info.stat_size);
-                    if info.is_compressed {
-                        println!("Compressed size: {}", info.on_disk_size);
-                        println!(
-                            "Compression savings: {:0.2}%",
-                            (1.0 - info.compressed_fraction()) * 100.0
-                        );
-                    }
-                    println!("Number of extended attributes: {}", info.xattr_count);
-                    println!(
-                        "Size of extended attributes: {} bytes",
-                        info.total_xattr_size
-                    );
+                    display_file_info(&path, &info);
                 }
             }
         }
+    }
+}
+
+fn display_folder_info(path: &Path, info: &info::AfscFolderInfo) {
+    println!("\n{}:", path.display());
+
+    println!("-- Files --");
+    println!("Compressed files:         {}", info.num_compressed_files);
+    println!("Total files:              {}", info.num_files);
+    println!("Total folders:            {}", info.num_folders);
+
+    println!();
+    println!("-- Storage --");
+    println!(
+        "Logical size:             {} ({})",
+        format_bytes(info.total_uncompressed_size),
+        info.total_uncompressed_size
+    );
+    println!(
+        "On-disk size:             {} ({})",
+        format_bytes(info.total_compressed_size),
+        info.total_compressed_size
+    );
+    println!(
+        "Compression savings:      {:.1}%",
+        info.compression_savings_fraction() * 100.0,
+    );
+}
+
+fn display_file_info(path: &Path, info: &info::AfscFileInfo) {
+    if info.is_compressed {
+        println!("{} is compressed", path.display());
+    } else {
+        println!("{} is not compressed", path.display());
+    }
+
+    if info.is_compressed {
+        println!();
+        println!("-- Compression --");
+        match &info.decmpfs_info {
+            Some(Ok(decmpfs_info)) => {
+                println!(
+                    "Compression type:         {}",
+                    decmpfs_info.compression_type
+                );
+                println!(
+                    "decmpfs logical size:     {} ({})",
+                    format_bytes(decmpfs_info.orig_file_size),
+                    decmpfs_info.orig_file_size
+                );
+                println!(
+                    "decmpfs xattr size:       {} ({})",
+                    format_bytes(decmpfs_info.attribute_size),
+                    decmpfs_info.attribute_size
+                );
+            }
+            Some(Err(decmpfs_err)) => {
+                tracing::error!(
+                    "compressed file has issue with decompfs xattr: {}",
+                    decmpfs_err
+                );
+            }
+            None => {
+                tracing::error!("compressed file has no decmpfs xattr");
+            }
+        }
+    }
+
+    println!();
+    println!("-- Storage --");
+    println!(
+        "Logical size:             {} ({})",
+        format_bytes(info.stat_size),
+        info.stat_size
+    );
+    println!(
+        "On-disk size:             {} ({})",
+        format_bytes(info.on_disk_size),
+        info.on_disk_size
+    );
+    if info.is_compressed {
+        println!(
+            "Compression savings:      {:.1}%",
+            (1.0 - info.compressed_fraction()) * 100.0
+        );
+    }
+
+    println!();
+    println!("-- Extended Attributes --");
+    println!("Extended attributes:      {}", info.xattr_count);
+    println!(
+        "Extended attribute size:  {} ({})",
+        format_bytes(info.total_xattr_size),
+        info.total_xattr_size
+    );
+    if let Some(resource_fork_size) = info.resource_fork_size {
+        println!(
+            "Resource fork size:       {} ({})",
+            format_bytes(resource_fork_size),
+            resource_fork_size
+        );
     }
 }
 
@@ -371,12 +414,18 @@ pub fn display_stats(stats: &Stats, compress_mode: bool) {
 
     let compressed_count_start = stats.compressed_file_count_start.load(Ordering::Relaxed);
     let compressed_count_final = stats.compressed_file_count_final.load(Ordering::Relaxed);
+    let compressed_size_start = stats.compressed_size_start.load(Ordering::Relaxed);
+    let compressed_size_final = stats.compressed_size_final.load(Ordering::Relaxed);
+
     if compress_mode {
-        println!(
-            "New Files Compressed: {} ({} total compressed)",
-            compressed_count_final.saturating_sub(compressed_count_start),
+        display_compress_stats(
+            total_file_sizes,
+            compressed_count_start,
             compressed_count_final,
+            compressed_size_start,
+            compressed_size_final,
         );
+        return;
     } else {
         print!(
             "Files Decompressed: {}",
@@ -389,8 +438,6 @@ pub fn display_stats(stats: &Stats, compress_mode: bool) {
         }
     }
 
-    let compressed_size_start = stats.compressed_size_start.load(Ordering::Relaxed);
-    let compressed_size_final = stats.compressed_size_final.load(Ordering::Relaxed);
     println!(
         "Starting Size (total filesize): {} ({})",
         format_bytes(total_file_sizes),
@@ -410,6 +457,78 @@ pub fn display_stats(stats: &Stats, compress_mode: bool) {
         "Savings:                        {:.1}%",
         stats.compression_change_portion() * 100.0
     );
+}
+
+fn display_compress_stats(
+    total_file_sizes: u64,
+    compressed_count_start: u64,
+    compressed_count_final: u64,
+    compressed_size_start: u64,
+    compressed_size_final: u64,
+) {
+    let new_compressed_files = compressed_count_final.saturating_sub(compressed_count_start);
+    let existing_saved = saved_bytes(total_file_sizes, compressed_size_start);
+    let additional_saved = saved_bytes(compressed_size_start, compressed_size_final);
+    let total_saved = saved_bytes(total_file_sizes, compressed_size_final);
+
+    println!("-- Existing Savings --");
+    println!("Already compressed files: {compressed_count_start}");
+    println!(
+        "Starting logical size:    {} ({})",
+        format_bytes(total_file_sizes),
+        total_file_sizes,
+    );
+    println!(
+        "Starting on-disk size:    {} ({})",
+        format_bytes(compressed_size_start),
+        compressed_size_start,
+    );
+    println!(
+        "Existing savings:         {:.1}%",
+        savings_percent(total_file_sizes, existing_saved)
+    );
+
+    println!();
+    println!("-- New Savings --");
+    println!("New files compressed:     {new_compressed_files}");
+    println!(
+        "Additional bytes saved:   {} ({additional_saved})",
+        format_signed_bytes(additional_saved),
+    );
+    println!(
+        "Additional savings:       {:.1}%",
+        savings_percent(compressed_size_start, additional_saved)
+    );
+
+    println!();
+    println!("-- Total Savings --");
+    println!("Total compressed files:   {compressed_count_final}");
+    println!(
+        "Final on-disk size:       {} ({})",
+        format_bytes(compressed_size_final),
+        compressed_size_final,
+    );
+    println!(
+        "Total savings:            {:.1}%",
+        savings_percent(total_file_sizes, total_saved)
+    );
+}
+
+fn saved_bytes(original_size: u64, final_size: u64) -> i128 {
+    i128::from(original_size) - i128::from(final_size)
+}
+
+fn savings_percent(original_size: u64, saved_bytes: i128) -> f64 {
+    if original_size == 0 {
+        0.0
+    } else {
+        saved_bytes as f64 / original_size as f64 * 100.0
+    }
+}
+
+fn format_signed_bytes(byte_size: i128) -> String {
+    let sign = if byte_size < 0 { "-" } else { "" };
+    format!("{sign}{}", format_bytes(byte_size.unsigned_abs() as u64))
 }
 
 #[must_use]
