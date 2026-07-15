@@ -425,38 +425,15 @@ pub fn display_stats(stats: &Stats, compress_mode: bool) {
             compressed_size_start,
             compressed_size_final,
         );
-        return;
     } else {
-        print!(
-            "Files Decompressed: {}",
-            compressed_count_start.saturating_sub(compressed_count_final),
+        display_decompress_stats(
+            total_file_sizes,
+            compressed_count_start,
+            compressed_count_final,
+            compressed_size_start,
+            compressed_size_final,
         );
-        if compressed_count_final != 0 {
-            println!(" ({compressed_count_final} remaining compressed)");
-        } else {
-            println!();
-        }
     }
-
-    println!(
-        "Starting Size (total filesize): {} ({})",
-        format_bytes(total_file_sizes),
-        total_file_sizes,
-    );
-    println!(
-        "Starting Size (on disk):        {} ({})",
-        format_bytes(compressed_size_start),
-        compressed_size_start,
-    );
-    println!(
-        "Final Size (on disk):           {} ({})",
-        format_bytes(compressed_size_final),
-        compressed_size_final,
-    );
-    println!(
-        "Savings:                        {:.1}%",
-        stats.compression_change_portion() * 100.0
-    );
 }
 
 fn display_compress_stats(
@@ -511,6 +488,59 @@ fn display_compress_stats(
     println!(
         "Total savings:            {:.1}%",
         savings_percent(total_file_sizes, total_saved)
+    );
+}
+
+fn display_decompress_stats(
+    total_file_sizes: u64,
+    compressed_count_start: u64,
+    compressed_count_final: u64,
+    compressed_size_start: u64,
+    compressed_size_final: u64,
+) {
+    let decompressed_files = compressed_count_start.saturating_sub(compressed_count_final);
+    let starting_saved = saved_bytes(total_file_sizes, compressed_size_start);
+    let final_saved = saved_bytes(total_file_sizes, compressed_size_final);
+    let additional_bytes_used = saved_bytes(compressed_size_final, compressed_size_start);
+    let savings_removed = savings_percent(total_file_sizes, starting_saved - final_saved);
+
+    println!("-- Starting Savings --");
+    println!("Compressed files:         {compressed_count_start}");
+    println!(
+        "Starting logical size:    {} ({})",
+        format_bytes(total_file_sizes),
+        total_file_sizes,
+    );
+    println!(
+        "Starting on-disk size:    {} ({})",
+        format_bytes(compressed_size_start),
+        compressed_size_start,
+    );
+    println!(
+        "Starting savings:         {:.1}%",
+        savings_percent(total_file_sizes, starting_saved)
+    );
+
+    println!();
+    println!("-- Decompression --");
+    println!("Files decompressed:       {decompressed_files}");
+    println!(
+        "Additional bytes used:    {} ({additional_bytes_used})",
+        format_signed_bytes(additional_bytes_used),
+    );
+    println!("Savings lost:             {savings_removed:.1} percentage points");
+
+    println!();
+    println!("-- Final Savings --");
+    println!("Remaining compressed:     {compressed_count_final}");
+    println!(
+        "Final on-disk size:       {} ({})",
+        format_bytes(compressed_size_final),
+        compressed_size_final,
+    );
+    println!(
+        "Final savings:            {:.1}%",
+        savings_percent(total_file_sizes, final_saved)
     );
 }
 
