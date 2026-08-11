@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
+use crate::progress::{Progress, Task as _};
 use crate::volumes::Volumes;
 use crate::xattr;
 pub use applesauce_core::decmpfs::CompressionType;
@@ -102,6 +103,32 @@ impl AfscFolderInfo {
 }
 
 pub fn get_recursive(path: &Path) -> io::Result<AfscFolderInfo> {
+    get_recursive_with(path, get)
+}
+
+pub fn count_recursive_files(path: &Path) -> io::Result<u64> {
+    let mut count = 0u64;
+    for entry in jwalk::WalkDir::new(path) {
+        let entry = entry?;
+        #[allow(clippy::filetype_is_file)]
+        if entry.file_type().is_file() && entry.metadata()?.nlink() <= 1 {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+pub fn get_recursive_with_progress<P: Progress>(
+    path: &Path,
+    progress: &P,
+) -> io::Result<AfscFolderInfo> {
+    get_recursive_with(path, |path| get_with_progress(path, progress))
+}
+
+fn get_recursive_with(
+    path: &Path,
+    mut get_file: impl FnMut(&Path) -> io::Result<AfscFileInfo>,
+) -> io::Result<AfscFolderInfo> {
     let mut result = AfscFolderInfo::default();
     for entry in jwalk::WalkDir::new(path) {
         let entry = entry?;
@@ -109,20 +136,28 @@ pub fn get_recursive(path: &Path) -> io::Result<AfscFolderInfo> {
 
         #[allow(clippy::filetype_is_file)]
         if file_type.is_file() {
-            let info = get(&entry.path())?;
+            if entry.metadata()?.nlink() > 1 {
+                continue;
+            }
+            let info = get_file(&entry.path())?;
             result.num_files += 1;
             if info.is_compressed {
                 result.num_compressed_files += 1;
-                result.total_compressed_size += info.on_disk_size;
-            } else {
-                result.total_compressed_size += info.stat_size;
             }
+            result.total_compressed_size += info.on_disk_size;
             result.total_uncompressed_size += info.stat_size;
         } else if file_type.is_dir() {
             result.num_folders += 1;
         }
     }
     Ok(result)
+}
+
+pub fn get_with_progress<P: Progress>(path: &Path, progress: &P) -> io::Result<AfscFileInfo> {
+    let task = progress.file_task(path, 1);
+    let result = get(path);
+    task.increment(1);
+    result
 }
 
 pub fn get_file_info(path: &Path, metadata: &Metadata, volumes: &Volumes) -> FileInfo {
@@ -254,4 +289,71 @@ fn decmpfs_info_from_bytes(data: &[u8]) -> Result<DecmpfsInfo, decmpfs::DecodeEr
         attribute_size: data.len().try_into().unwrap(),
         orig_file_size: value.uncompressed_size,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::progress::Task;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct CountingProgress {
+        tasks: AtomicU64,
+        increments: Arc<AtomicU64>,
+    }
+
+    struct CountingTask {
+        increments: Arc<AtomicU64>,
+    }
+
+    impl Progress for CountingProgress {
+        type Task = CountingTask;
+
+        fn error(&self, _path: &Path, _message: &str) {}
+
+        fn file_task(&self, _path: &Path, size: u64) -> Self::Task {
+            assert_eq!(size, 1);
+            self.tasks.fetch_add(1, Ordering::Relaxed);
+            CountingTask {
+                increments: Arc::clone(&self.increments),
+            }
+        }
+    }
+
+    impl Task for CountingTask {
+        fn increment(&self, amount: u64) {
+            self.increments.fetch_add(amount, Ordering::Relaxed);
+        }
+
+        fn error(&self, _message: &str) {}
+    }
+
+    #[test]
+    fn recursive_info_matches_compression_accounting_and_reports_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("one"), b"one").unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join("nested/two"), b"two").unwrap();
+        fs::write(dir.path().join("hard-link-source"), b"linked").unwrap();
+        fs::hard_link(
+            dir.path().join("hard-link-source"),
+            dir.path().join("hard-link-alias"),
+        )
+        .unwrap();
+        let progress = CountingProgress::default();
+
+        assert_eq!(count_recursive_files(dir.path()).unwrap(), 2);
+        let info = get_recursive_with_progress(dir.path(), &progress).unwrap();
+        let expected_on_disk_size = get(&dir.path().join("one")).unwrap().on_disk_size
+            + get(&dir.path().join("nested/two")).unwrap().on_disk_size;
+
+        assert_eq!(info.num_files, 2);
+        assert_eq!(info.total_uncompressed_size, 6);
+        assert_eq!(info.total_compressed_size, expected_on_disk_size);
+        assert_eq!(progress.tasks.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.increments.load(Ordering::Relaxed), 2);
+    }
 }

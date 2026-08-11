@@ -45,20 +45,27 @@ To install Applesauce using Cargo, follow these steps:
 To use Applesauce, run the following command:
 
 ```console
-applesauce [compress|decompress|info] file/directory
+applesauce [compress|decompress|info] [OPTIONS] <PATHS>...
 ```
 
 The options are as follows:
 
 - `compress`: Compresses the specified file/directory using one of three compression algorithms (LZFSE, LZVN, or ZLIB).
 - `decompress`: Decompresses the specified file/directory.
-- `info`: Prints information about the specified compressed file/directory, including the compression ratio and
-  compression algorithm used.
+- `info`: Prints information about each specified file/directory, including the compression ratio and
+  compression algorithm used. A progress bar tracks files as they are inspected. Pass `--summary` to print one
+  aggregate file and storage summary across all paths using the same file and storage accounting as compression.
 
 For example, to compress a file named `example.txt` using the ZLIB compression algorithm, you would run:
 
 ```console
 applesauce compress -c ZLIB example.txt
+```
+
+To print one aggregate summary for multiple paths, run:
+
+```console
+applesauce info --summary path/to/first path/to/second
 ```
 
 ## Features

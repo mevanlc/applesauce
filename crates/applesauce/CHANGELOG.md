@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add progress-aware APIs for file and recursive compression information.
+
+### Fixed
+- Align recursive information with compression statistics by excluding multiply linked files and using allocated size.
+
 ## [0.8.8](https://github.com/Dr-Emann/applesauce/compare/applesauce-v0.8.7...applesauce-v0.8.8) - 2026-06-02
 
 ### Other

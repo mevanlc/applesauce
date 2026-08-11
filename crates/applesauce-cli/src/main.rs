@@ -125,9 +125,13 @@ struct Compress {
 struct Info {
     /// Paths to inspect
     ///
-    /// Info will be reported for each path
+    /// Info will be reported for each path unless --summary is used
     #[arg(required = true)]
     paths: Vec<PathBuf>,
+
+    /// Report a single summary across all paths
+    #[arg(long)]
+    summary: bool,
 }
 
 #[derive(Debug, Copy, Clone, clap::ValueEnum, PartialEq, Eq)]
@@ -201,7 +205,10 @@ fn main() {
         layer
     });
 
-    let progress_bars = ProgressBars::new(cli.verbosity());
+    let progress_bars = match &cli.command {
+        Commands::Info(_) => ProgressBars::for_info(cli.verbosity()),
+        Commands::Compress(_) | Commands::Decompress(_) => ProgressBars::new(cli.verbosity()),
+    };
     let fmt_writer = Mutex::new(LineWriter::new(ProgressBarWriter::new(
         progress_bars.multi_progress().clone(),
         io::stderr(),
@@ -271,24 +278,38 @@ fn main() {
                 display_stats(&stats, false);
             }
         }
-        Commands::Info(info) => {
-            for path in info.paths {
-                if path.is_dir() {
-                    let info = info::get_recursive(&path);
-                    let info = match info {
-                        Ok(info) => info,
-                        Err(e) => {
-                            tracing::error!(
-                                "error reading compression info for {}: {}",
-                                path.display(),
-                                e,
-                            );
-                            continue;
-                        }
-                    };
-                    display_folder_info(&path, &info);
+        Commands::Info(Info { paths, summary }) => {
+            let total_files = paths.iter().fold(0u64, |total, path| {
+                let path_files = if path.is_dir() {
+                    info::count_recursive_files(path).unwrap_or(0)
                 } else {
-                    let info = info::get(&path);
+                    1
+                };
+                total.saturating_add(path_files)
+            });
+            progress_bars.set_total(total_files);
+
+            if summary {
+                let mut summary_info = info::AfscFolderInfo::default();
+                for path in paths {
+                    match info::get_recursive_with_progress(&path, &progress_bars) {
+                        Ok(path_info) => add_folder_info(&mut summary_info, &path_info),
+                        Err(e) => tracing::error!(
+                            "error reading compression info for {}: {}",
+                            path.display(),
+                            e,
+                        ),
+                    }
+                }
+                progress_bars.finish();
+                drop(progress_bars);
+                display_folder_summary(&summary_info);
+                return;
+            }
+
+            for path in paths {
+                if path.is_dir() {
+                    let info = info::get_recursive_with_progress(&path, &progress_bars);
                     let info = match info {
                         Ok(info) => info,
                         Err(e) => {
@@ -300,9 +321,28 @@ fn main() {
                             continue;
                         }
                     };
-                    display_file_info(&path, &info);
+                    progress_bars
+                        .multi_progress()
+                        .suspend(|| display_folder_info(&path, &info));
+                } else {
+                    let info = info::get_with_progress(&path, &progress_bars);
+                    let info = match info {
+                        Ok(info) => info,
+                        Err(e) => {
+                            tracing::error!(
+                                "error reading compression info for {}: {}",
+                                path.display(),
+                                e,
+                            );
+                            continue;
+                        }
+                    };
+                    progress_bars
+                        .multi_progress()
+                        .suspend(|| display_file_info(&path, &info));
                 }
             }
+            progress_bars.finish();
         }
     }
 }
@@ -310,6 +350,10 @@ fn main() {
 fn display_folder_info(path: &Path, info: &info::AfscFolderInfo) {
     println!("\n{}:", path.display());
 
+    display_folder_summary(info);
+}
+
+fn display_folder_summary(info: &info::AfscFolderInfo) {
     println!("-- Files --");
     println!("Compressed files:         {}", info.num_compressed_files);
     println!("Total files:              {}", info.num_files);
@@ -331,6 +375,14 @@ fn display_folder_info(path: &Path, info: &info::AfscFolderInfo) {
         "Compression savings:      {:.1}%",
         info.compression_savings_fraction() * 100.0,
     );
+}
+
+fn add_folder_info(total: &mut info::AfscFolderInfo, info: &info::AfscFolderInfo) {
+    total.num_compressed_files += info.num_compressed_files;
+    total.num_files += info.num_files;
+    total.num_folders += info.num_folders;
+    total.total_uncompressed_size += info.total_uncompressed_size;
+    total.total_compressed_size += info.total_compressed_size;
 }
 
 fn display_file_info(path: &Path, info: &info::AfscFileInfo) {
@@ -651,4 +703,41 @@ fn truncate_single_segment() {
 fn command_check() {
     use clap::CommandFactory;
     Cli::command().debug_assert()
+}
+
+#[test]
+fn info_summary_arguments() {
+    let cli = Cli::try_parse_from(["applesauce", "info", "--summary", "one", "two"])
+        .expect("summary arguments should parse");
+    let Commands::Info(info) = cli.command else {
+        panic!("expected info command");
+    };
+
+    assert!(info.summary);
+    assert_eq!(info.paths, [PathBuf::from("one"), PathBuf::from("two")]);
+}
+
+#[test]
+fn folder_info_is_aggregated() {
+    let mut total = info::AfscFolderInfo::default();
+    total.num_compressed_files = 2;
+    total.num_files = 3;
+    total.num_folders = 1;
+    total.total_uncompressed_size = 1_000;
+    total.total_compressed_size = 600;
+
+    let mut additional = info::AfscFolderInfo::default();
+    additional.num_compressed_files = 4;
+    additional.num_files = 5;
+    additional.num_folders = 2;
+    additional.total_uncompressed_size = 2_000;
+    additional.total_compressed_size = 800;
+
+    add_folder_info(&mut total, &additional);
+
+    assert_eq!(total.num_compressed_files, 6);
+    assert_eq!(total.num_files, 8);
+    assert_eq!(total.num_folders, 3);
+    assert_eq!(total.total_uncompressed_size, 3_000);
+    assert_eq!(total.total_compressed_size, 1_400);
 }

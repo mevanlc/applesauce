@@ -3,6 +3,7 @@ use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressState, Progre
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,7 @@ pub struct ProgressBars {
     total_bar: ProgressBar,
     bars: MultiProgress,
     verbosity: Verbosity,
+    total_is_known: AtomicBool,
 }
 
 impl ProgressBars {
@@ -41,44 +43,68 @@ impl ProgressBars {
 
 impl ProgressBars {
     pub fn new(verbosity: Verbosity) -> Self {
+        Self::with_units(verbosity, Units::Bytes)
+    }
+
+    pub fn for_info(verbosity: Verbosity) -> Self {
+        Self::with_units(verbosity, Units::Files)
+    }
+
+    pub fn set_total(&self, total: u64) {
+        self.total_bar.set_length(total);
+        self.total_is_known.store(true, Ordering::Relaxed);
+    }
+
+    fn with_units(verbosity: Verbosity, units: Units) -> Self {
         let bars = MultiProgress::new();
         let smoothed_eta = |s: &ProgressState, w: &mut dyn fmt::Write| match (s.pos(), s.len()) {
             (pos, Some(len)) if pos != 0 => write!(
                 w,
                 "{:#}",
                 HumanDuration(Duration::from_millis(
-                    (s.elapsed().as_millis() * (len as u128 - pos as u128) / (pos as u128)) as u64
+                    (s.elapsed().as_millis() * u128::from(len.saturating_sub(pos))
+                        / u128::from(pos)) as u64
                 ))
             )
             .unwrap(),
             _ => write!(w, "-").unwrap(),
         };
+        let (total_template, file_template) = match units {
+            Units::Bytes => (
+                "{prefix:>25.bold} {wide_bar:.green} {bytes:>11}/{total_bytes:<11} {smoothed_eta:6}",
+                "{prefix:>25.dim} {wide_bar} {bytes:>11}/{total_bytes:<11} {smoothed_eta:6}",
+            ),
+            Units::Files => (
+                "{prefix:>25.bold} {spinner:.green} {wide_bar:.green} {pos:>8}/{len:<8} files {smoothed_eta:6}",
+                "{prefix:>25.dim} {spinner} {wide_bar} {pos:>8}/{len:<8} files {smoothed_eta:6}",
+            ),
+        };
         #[allow(unknown_lints)] // TODO: Remove this once this clippy check is on stable
         #[allow(clippy::literal_string_with_formatting_args)]
-        let total_style = ProgressStyle::with_template(
-            "{prefix:>25.bold} {wide_bar:.green} {bytes:>11}/{total_bytes:<11} {smoothed_eta:6}",
-        )
-        .unwrap()
-        .with_key("smoothed_eta", smoothed_eta);
+        let total_style = ProgressStyle::with_template(total_template)
+            .unwrap()
+            .with_key("smoothed_eta", smoothed_eta);
 
         #[allow(unknown_lints)] // TODO: Remove this once this clippy check is on stable
         #[allow(clippy::literal_string_with_formatting_args)]
-        let style = ProgressStyle::with_template(
-            "{prefix:>25.dim} {wide_bar} {bytes:>11}/{total_bytes:<11} {smoothed_eta:6}",
-        )
-        .unwrap()
-        .with_key("smoothed_eta", smoothed_eta);
+        let style = ProgressStyle::with_template(file_template)
+            .unwrap()
+            .with_key("smoothed_eta", smoothed_eta);
 
         let total_bar = bars
             .add(ProgressBar::new(0))
             .with_style(total_style)
             .with_prefix("Total:");
+        if matches!(units, Units::Files) {
+            total_bar.enable_steady_tick(DELAY);
+        }
 
         Self {
             style,
             total_bar,
             bars,
             verbosity,
+            total_is_known: AtomicBool::new(false),
         }
     }
 
@@ -91,6 +117,12 @@ impl ProgressBars {
     pub fn multi_progress(&self) -> &MultiProgress {
         &self.bars
     }
+}
+
+#[derive(Copy, Clone)]
+enum Units {
+    Bytes,
+    Files,
 }
 
 enum State {
@@ -169,7 +201,9 @@ impl Progress for ProgressBars {
             .with_prefix(prefix.to_string_lossy().into_owned());
 
         single.set_length(size);
-        total.inc_length(size);
+        if !self.total_is_known.load(Ordering::Relaxed) {
+            total.inc_length(size);
+        }
         ProgressWithTotal {
             total,
             single,
