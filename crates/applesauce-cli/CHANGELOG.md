@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `info --summary` to report aggregate compression information across multiple paths.
 - Show file-count progress while gathering `info` results.
 - Align recursive `info` file and storage accounting with compression statistics.
+- Gather recursive `info` results in parallel without a separate file-counting pass.
 
 ## [0.5.28](https://github.com/Dr-Emann/applesauce/compare/applesauce-cli-v0.5.27...applesauce-cli-v0.5.28) - 2026-06-02
 

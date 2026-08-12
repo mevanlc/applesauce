@@ -3,7 +3,6 @@ use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressState, Progre
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,7 +30,6 @@ pub struct ProgressBars {
     total_bar: ProgressBar,
     bars: MultiProgress,
     verbosity: Verbosity,
-    total_is_known: AtomicBool,
 }
 
 impl ProgressBars {
@@ -48,11 +46,6 @@ impl ProgressBars {
 
     pub fn for_info(verbosity: Verbosity) -> Self {
         Self::with_units(verbosity, Units::Files)
-    }
-
-    pub fn set_total(&self, total: u64) {
-        self.total_bar.set_length(total);
-        self.total_is_known.store(true, Ordering::Relaxed);
     }
 
     fn with_units(verbosity: Verbosity, units: Units) -> Self {
@@ -104,7 +97,6 @@ impl ProgressBars {
             total_bar,
             bars,
             verbosity,
-            total_is_known: AtomicBool::new(false),
         }
     }
 
@@ -201,9 +193,7 @@ impl Progress for ProgressBars {
             .with_prefix(prefix.to_string_lossy().into_owned());
 
         single.set_length(size);
-        if !self.total_is_known.load(Ordering::Relaxed) {
-            total.inc_length(size);
-        }
+        total.inc_length(size);
         ProgressWithTotal {
             total,
             single,

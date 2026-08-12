@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Add progress-aware APIs for file and recursive compression information.
+- Gather recursive compression information in parallel.
 
 ### Fixed
 - Align recursive information with compression statistics by excluding multiply linked files and using allocated size.

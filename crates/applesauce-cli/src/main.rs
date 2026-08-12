@@ -279,16 +279,6 @@ fn main() {
             }
         }
         Commands::Info(Info { paths, summary }) => {
-            let total_files = paths.iter().fold(0u64, |total, path| {
-                let path_files = if path.is_dir() {
-                    info::count_recursive_files(path).unwrap_or(0)
-                } else {
-                    1
-                };
-                total.saturating_add(path_files)
-            });
-            progress_bars.set_total(total_files);
-
             if summary {
                 let mut summary_info = info::AfscFolderInfo::default();
                 for path in paths {

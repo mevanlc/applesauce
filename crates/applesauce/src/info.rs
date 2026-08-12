@@ -1,4 +1,5 @@
 use applesauce_core::{decmpfs, round_to_block_size};
+use jwalk::rayon::iter::{ParallelBridge as _, ParallelIterator as _};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::Metadata;
@@ -118,39 +119,49 @@ pub fn count_recursive_files(path: &Path) -> io::Result<u64> {
     Ok(count)
 }
 
-pub fn get_recursive_with_progress<P: Progress>(
+pub fn get_recursive_with_progress<P: Progress + Sync>(
     path: &Path,
     progress: &P,
 ) -> io::Result<AfscFolderInfo> {
     get_recursive_with(path, |path| get_with_progress(path, progress))
 }
 
-fn get_recursive_with(
-    path: &Path,
-    mut get_file: impl FnMut(&Path) -> io::Result<AfscFileInfo>,
-) -> io::Result<AfscFolderInfo> {
-    let mut result = AfscFolderInfo::default();
-    for entry in jwalk::WalkDir::new(path) {
-        let entry = entry?;
-        let file_type = entry.file_type();
+fn get_recursive_with<F>(path: &Path, get_file: F) -> io::Result<AfscFolderInfo>
+where
+    F: Fn(&Path) -> io::Result<AfscFileInfo> + Sync,
+{
+    jwalk::WalkDir::new(path)
+        .into_iter()
+        .par_bridge()
+        .try_fold(AfscFolderInfo::default, |mut result, entry| {
+            let entry = entry?;
+            let file_type = entry.file_type();
 
-        #[allow(clippy::filetype_is_file)]
-        if file_type.is_file() {
-            if entry.metadata()?.nlink() > 1 {
-                continue;
+            #[allow(clippy::filetype_is_file)]
+            if file_type.is_file() {
+                if entry.metadata()?.nlink() > 1 {
+                    return Ok(result);
+                }
+                let info = get_file(&entry.path())?;
+                result.num_files += 1;
+                if info.is_compressed {
+                    result.num_compressed_files += 1;
+                }
+                result.total_compressed_size += info.on_disk_size;
+                result.total_uncompressed_size += info.stat_size;
+            } else if file_type.is_dir() {
+                result.num_folders += 1;
             }
-            let info = get_file(&entry.path())?;
-            result.num_files += 1;
-            if info.is_compressed {
-                result.num_compressed_files += 1;
-            }
-            result.total_compressed_size += info.on_disk_size;
-            result.total_uncompressed_size += info.stat_size;
-        } else if file_type.is_dir() {
-            result.num_folders += 1;
-        }
-    }
-    Ok(result)
+            Ok(result)
+        })
+        .try_reduce(AfscFolderInfo::default, |mut total, partial| {
+            total.num_files += partial.num_files;
+            total.num_folders += partial.num_folders;
+            total.num_compressed_files += partial.num_compressed_files;
+            total.total_uncompressed_size += partial.total_uncompressed_size;
+            total.total_compressed_size += partial.total_compressed_size;
+            Ok(total)
+        })
 }
 
 pub fn get_with_progress<P: Progress>(path: &Path, progress: &P) -> io::Result<AfscFileInfo> {
