@@ -252,11 +252,8 @@ fn main() {
                 verify,
             );
             progress_bars.finish();
-            drop(progress_bars);
             tracing::info!("Finished compressing");
             if verbosity >= Verbosity::Normal {
-                // It seems dropping the progress bars may not be synchronous, so wait a little bit
-                std::thread::sleep(std::time::Duration::from_millis(100));
                 display_stats(&stats, true);
             }
         }
@@ -292,7 +289,6 @@ fn main() {
                     }
                 }
                 progress_bars.finish();
-                drop(progress_bars);
                 display_folder_summary(&summary_info);
                 return;
             }
