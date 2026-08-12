@@ -36,8 +36,8 @@ pub struct ProgressBars {
 
 impl ProgressBars {
     pub fn finish(&self) {
+        self.total_bar.finish_and_clear();
         let _ = self.bars.clear();
-        self.total_bar.finish();
     }
 }
 
@@ -56,7 +56,10 @@ impl ProgressBars {
     }
 
     fn with_units(verbosity: Verbosity, units: Units) -> Self {
-        let bars = MultiProgress::new();
+        Self::with_multi_progress(verbosity, units, MultiProgress::new())
+    }
+
+    fn with_multi_progress(verbosity: Verbosity, units: Units, bars: MultiProgress) -> Self {
         let smoothed_eta = |s: &ProgressState, w: &mut dyn fmt::Write| match (s.pos(), s.len()) {
             (pos, Some(len)) if pos != 0 => write!(
                 w,
@@ -256,5 +259,82 @@ impl<W: Write> Write for ProgressBarWriter<W> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.multi_progress.suspend(|| self.inner.flush())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indicatif::{ProgressDrawTarget, TermLike};
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug, Default)]
+    struct TestTerm {
+        line_visible: Arc<AtomicBool>,
+    }
+
+    impl TestTerm {
+        fn line_visible(&self) -> bool {
+            self.line_visible.load(Ordering::Relaxed)
+        }
+    }
+
+    impl TermLike for TestTerm {
+        fn width(&self) -> u16 {
+            120
+        }
+
+        fn move_cursor_up(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_down(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_right(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_left(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn write_line(&self, s: &str) -> std::io::Result<()> {
+            self.line_visible.store(!s.is_empty(), Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn write_str(&self, s: &str) -> std::io::Result<()> {
+            if !s.is_empty() {
+                self.line_visible.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn clear_line(&self) -> std::io::Result<()> {
+            self.line_visible.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finish_clears_rendered_progress_bars() {
+        let term = TestTerm::default();
+        let bars =
+            MultiProgress::with_draw_target(ProgressDrawTarget::term_like(Box::new(term.clone())));
+        let progress = ProgressBars::with_multi_progress(Verbosity::Normal, Units::Bytes, bars);
+        let file_bar = progress.bars.add(ProgressBar::new(1));
+
+        progress.total_bar.tick();
+        file_bar.tick();
+        assert!(term.line_visible());
+
+        progress.finish();
+        assert!(!term.line_visible());
     }
 }
