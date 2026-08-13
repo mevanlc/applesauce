@@ -56,6 +56,7 @@ enum Commands {
     Compress(Compress),
 
     /// Decompress files
+    #[command(alias = "uncompress")]
     Decompress(Decompress),
 
     /// Get info about compression for file(s)
@@ -701,6 +702,23 @@ fn info_summary_arguments() {
 
     assert!(info.summary);
     assert_eq!(info.paths, [PathBuf::from("one"), PathBuf::from("two")]);
+}
+
+#[test]
+fn uncompress_alias() {
+    let cli = Cli::try_parse_from(["applesauce", "uncompress", "somefile"])
+        .expect("uncompress alias should parse");
+    let Commands::Decompress(decompress) = cli.command else {
+        panic!("expected decompress command");
+    };
+    assert_eq!(decompress.paths, [PathBuf::from("somefile")]);
+
+    // Verify uncompress is hidden from help output
+    let mut help_buf = Vec::new();
+    use clap::CommandFactory;
+    Cli::command().write_help(&mut help_buf).unwrap();
+    let help_str = String::from_utf8(help_buf).unwrap();
+    assert!(!help_str.contains("uncompress"));
 }
 
 #[test]
