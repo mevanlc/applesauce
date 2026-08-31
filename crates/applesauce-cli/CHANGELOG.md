@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Clear progress bars when the command finishes.
+- Keep the final compression summary visible with one `-q`; suppress it with `-qq`.
 
 ## [0.5.28](https://github.com/Dr-Emann/applesauce/compare/applesauce-cli-v0.5.27...applesauce-cli-v0.5.28) - 2026-06-02
 

@@ -35,6 +35,9 @@ struct Cli {
     #[arg(short, long, global(true), action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Reduce output
+    ///
+    /// Repeat to suppress the final compression summary
     #[arg(short, long, global(true), action = clap::ArgAction::Count, conflicts_with = "verbose")]
     quiet: u8,
 }
@@ -47,6 +50,10 @@ impl Cli {
             0 => Verbosity::Normal,
             1.. => Verbosity::Verbose,
         }
+    }
+
+    fn show_compression_summary(&self) -> bool {
+        self.quiet < 2
     }
 }
 
@@ -194,6 +201,7 @@ fn chrome_tracing_file(path: Option<&Path>) -> Option<impl io::Write> {
 fn main() {
     let cli = Cli::parse();
     let verbosity = cli.verbosity();
+    let show_compression_summary = cli.show_compression_summary();
 
     let mut _chrome_guard = None;
     let chrome_file = chrome_tracing_file(cli.chrome_tracing.as_deref());
@@ -254,7 +262,7 @@ fn main() {
             );
             progress_bars.finish();
             tracing::info!("Finished compressing");
-            if verbosity >= Verbosity::Normal {
+            if show_compression_summary {
                 display_stats(&stats, true);
             }
         }
@@ -702,6 +710,18 @@ fn info_summary_arguments() {
 
     assert!(info.summary);
     assert_eq!(info.paths, [PathBuf::from("one"), PathBuf::from("two")]);
+}
+
+#[test]
+fn compression_summary_requires_two_quiet_flags_to_suppress() {
+    let normal = Cli::try_parse_from(["applesauce", "compress", "somefile"]).unwrap();
+    assert!(normal.show_compression_summary());
+
+    let quiet = Cli::try_parse_from(["applesauce", "compress", "-q", "somefile"]).unwrap();
+    assert!(quiet.show_compression_summary());
+
+    let silent = Cli::try_parse_from(["applesauce", "compress", "-qq", "somefile"]).unwrap();
+    assert!(!silent.show_compression_summary());
 }
 
 #[test]
