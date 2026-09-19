@@ -1,7 +1,7 @@
+use crate::scratch::COMPRESSED_BLOCK_CAPACITY;
 use crate::seq_queue;
 use crate::threads::{writer, BgWork, Context, Mode, WorkHandler};
 use applesauce_core::compressor::{self, Compressor};
-use applesauce_core::BLOCK_SIZE;
 use std::io;
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ impl BgWork for Work {
     fn make_handler(&self) -> Self::Handler {
         Handler {
             compressors: (0..3).map(|_| None).collect(),
-            buf: vec![0; BLOCK_SIZE + 1024],
+            buf: vec![0; COMPRESSED_BLOCK_CAPACITY],
         }
     }
 

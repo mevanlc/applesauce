@@ -68,7 +68,7 @@ impl ProgressBars {
         let (total_template, file_template) = match units {
             Units::Bytes => (
                 "{prefix:>25.bold} {wide_bar:.green} {bytes:>11}/{total_bytes:<11} {smoothed_eta:6}",
-                "{prefix:>25.dim} {wide_bar} {bytes:>11}/{total_bytes:<11} {smoothed_eta:6}",
+                "{prefix:>25.dim} {wide_bar} {bytes:>11}/{total_bytes:<11} {smoothed_eta:6} {msg}",
             ),
             Units::Files => (
                 "{prefix:>25.bold} {spinner:.green} {wide_bar:.green} {pos:>8}/{len:<8} files {smoothed_eta:6}",
@@ -210,6 +210,10 @@ impl Progress for ProgressBars {
 }
 
 impl Task for ProgressWithTotal {
+    fn phase(&self, message: &'static str) {
+        self.single.set_message(message);
+        self.maybe_attach();
+    }
     fn increment(&self, amt: u64) {
         self.total.inc(amt);
         self.single.inc(amt);

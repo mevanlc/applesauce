@@ -171,6 +171,37 @@ impl WorkHandler<WorkItem> for Handler {
     fn handle_item(&mut self, item: WorkItem) {
         let WorkItem { context } = item;
         let _guard = tracing::info_span!("reading file", path=%context.path.display()).entered();
+        let reservation = match &context.operation.scratch {
+            Some(scratch) => {
+                context.progress.phase("Waiting for scratch space");
+                let size = context.orig_metadata.len();
+                let reservation = match context.operation.mode {
+                    Mode::Compress { kind, .. } => scratch.reserve(kind, size),
+                    Mode::DecompressManually | Mode::DecompressByReading => {
+                        scratch.reserve_uncompressed(size)
+                    }
+                };
+                match reservation {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) => {
+                        context
+                            .progress
+                            .error(&format!("{}: {error}", context.path.display()));
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        if reservation.is_some() {
+            context
+                .progress
+                .phase(if context.operation.mode.is_compressing() {
+                    "Compressing to scratch"
+                } else {
+                    "Decompressing to scratch"
+                });
+        }
         let file = match File::open(&context.path) {
             Ok(file) => file,
             Err(e) => {
@@ -196,6 +227,7 @@ impl WorkHandler<WorkItem> for Handler {
                     context: Arc::clone(&context),
                     file: Arc::clone(&file),
                     blocks: rx,
+                    reservation,
                 })
                 .unwrap();
         }

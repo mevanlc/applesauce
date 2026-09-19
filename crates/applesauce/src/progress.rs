@@ -40,6 +40,7 @@ pub trait Task {
     fn increment(&self, amt: u64);
     fn error(&self, message: &str);
     fn not_compressible_enough(&self, _path: &Path) {}
+    fn phase(&self, _message: &'static str) {}
 }
 
 impl<P: Progress> Progress for &'_ P {
@@ -59,6 +60,9 @@ impl<P: Progress> Progress for &'_ P {
 }
 
 impl<T: Task> Task for &'_ T {
+    fn phase(&self, message: &'static str) {
+        T::phase(self, message)
+    }
     fn increment(&self, amt: u64) {
         T::increment(self, amt)
     }

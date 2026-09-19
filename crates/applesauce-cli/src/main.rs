@@ -83,12 +83,15 @@ struct Decompress {
     #[arg(long)]
     manual: bool,
 
-    /// Verify that the compressed file has the same contents as the original before replacing it
+    /// Verify that the decompressed file has the same contents as the original before replacing it
     ///
-    /// This is an extra safety check to ensure that the compressed file is exactly the same as the
+    /// This is an extra safety check to ensure that the decompressed file is exactly the same as the
     /// original file.
     #[arg(long)]
     verify: bool,
+
+    #[command(flatten)]
+    scratch_options: ScratchOptions,
 }
 
 #[derive(Debug, clap::Args)]
@@ -127,6 +130,76 @@ struct Compress {
     /// original file.
     #[arg(long)]
     verify: bool,
+
+    #[command(flatten)]
+    scratch_options: ScratchOptions,
+}
+
+#[derive(Debug, clap::Args)]
+struct ScratchOptions {
+    /// Stage output in this directory, then copy completed files to their destination one at a time
+    #[arg(long, value_name = "DIR")]
+    scratch: Option<PathBuf>,
+
+    /// Maximum scratch backlog, including reservations for files being processed (default: 16GiB)
+    ///
+    /// Accepts bytes or integer sizes such as 512MiB, 16GiB, or 16GB.
+    /// Files whose worst-case output exceeds the limit are left unchanged.
+    /// Decompression reserves the full uncompressed size of each file.
+    /// Filesystem overhead and destination temporary files are excluded.
+    #[arg(long, value_name = "SIZE", requires = "scratch", value_parser = parse_scratch_limit)]
+    scratch_limit: Option<u64>,
+}
+
+const DEFAULT_SCRATCH_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
+
+impl ScratchOptions {
+    fn file_compressor(self) -> applesauce::FileCompressor {
+        match self.scratch {
+            Some(directory) => applesauce::FileCompressor::with_scratch(
+                &directory,
+                self.scratch_limit.unwrap_or(DEFAULT_SCRATCH_LIMIT),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "Unable to use scratch directory {}: {error}",
+                    directory.display()
+                );
+                std::process::exit(1);
+            }),
+            None => applesauce::FileCompressor::new(),
+        }
+    }
+}
+
+fn parse_scratch_limit(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = value[..split]
+        .parse::<u64>()
+        .map_err(|_| "expected a positive integer size, such as 16GiB".to_owned())?;
+    let multiplier: u64 = match value[split..].trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" => 1024,
+        "mib" => 1024_u64.pow(2),
+        "gib" => 1024_u64.pow(3),
+        "tib" => 1024_u64.pow(4),
+        "kb" => 1000,
+        "mb" => 1000_u64.pow(2),
+        "gb" => 1000_u64.pow(3),
+        "tb" => 1000_u64.pow(4),
+        _ => {
+            return Err(
+                "expected bytes or a B, KB, MB, GB, TB, KiB, MiB, GiB, or TiB suffix".to_owned(),
+            )
+        }
+    };
+    number
+        .checked_mul(multiplier)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| "scratch limit must be greater than zero and fit in 64 bits".to_owned())
 }
 
 #[derive(Debug, clap::Args)]
@@ -244,6 +317,7 @@ fn main() {
             minimum_compression_ratio,
             level,
             verify,
+            scratch_options,
         }) => {
             let kind: Kind = compression.into();
 
@@ -251,7 +325,7 @@ fn main() {
                 tracing::warn!("Compression level is ignored for non-zlib compression");
             }
 
-            let mut compressor = applesauce::FileCompressor::new();
+            let mut compressor = scratch_options.file_compressor();
             let stats = compressor.recursive_compress(
                 paths.iter().map(Path::new),
                 kind,
@@ -270,8 +344,9 @@ fn main() {
             paths,
             manual,
             verify,
+            scratch_options,
         }) => {
-            let mut compressor = applesauce::FileCompressor::new();
+            let mut compressor = scratch_options.file_compressor();
             let stats = compressor.recursive_decompress(
                 paths.iter().map(Path::new),
                 manual,
@@ -698,6 +773,70 @@ fn truncate_single_segment() {
 fn command_check() {
     use clap::CommandFactory;
     Cli::command().debug_assert()
+}
+
+#[test]
+fn scratch_arguments_and_sizes() {
+    let cli = Cli::try_parse_from([
+        "applesauce",
+        "compress",
+        "--scratch=/tmp",
+        "--scratch-limit=16GiB",
+        ".",
+    ])
+    .unwrap();
+    let Commands::Compress(options) = cli.command else {
+        panic!("expected compress")
+    };
+    assert_eq!(options.scratch_options.scratch, Some(PathBuf::from("/tmp")));
+    assert_eq!(
+        options.scratch_options.scratch_limit,
+        Some(DEFAULT_SCRATCH_LIMIT)
+    );
+    assert_eq!(parse_scratch_limit("16GB").unwrap(), 16_000_000_000);
+    assert_eq!(parse_scratch_limit("512MiB").unwrap(), 512 * 1024 * 1024);
+    assert_eq!(parse_scratch_limit(" 1024 ").unwrap(), 1024);
+    for value in ["0", "-1", "1.5GiB", "xyz", "18446744073709551615TiB"] {
+        assert!(parse_scratch_limit(value).is_err(), "{value}");
+    }
+    assert!(Cli::try_parse_from(["applesauce", "compress", "--scratch-limit=1GiB", "."]).is_err());
+    let cli = Cli::try_parse_from(["applesauce", "compress", "--scratch=/tmp", "."]).unwrap();
+    let Commands::Compress(options) = cli.command else {
+        panic!("expected compress")
+    };
+    assert_eq!(
+        options
+            .scratch_options
+            .scratch_limit
+            .unwrap_or(DEFAULT_SCRATCH_LIMIT),
+        16 * 1024 * 1024 * 1024
+    );
+}
+
+#[test]
+fn decompress_scratch_arguments() {
+    for command in ["decompress", "uncompress"] {
+        let cli = Cli::try_parse_from([
+            "applesauce",
+            command,
+            "--scratch=/tmp",
+            "--scratch-limit=512MiB",
+            "--manual",
+            "--verify",
+            ".",
+        ])
+        .unwrap();
+        let Commands::Decompress(options) = cli.command else {
+            panic!("expected decompress")
+        };
+        assert!(options.manual && options.verify);
+        assert_eq!(options.scratch_options.scratch, Some(PathBuf::from("/tmp")));
+        assert_eq!(
+            options.scratch_options.scratch_limit,
+            Some(512 * 1024 * 1024)
+        );
+        assert!(Cli::try_parse_from(["applesauce", command, "--scratch-limit=1GiB", "."]).is_err());
+    }
 }
 
 #[test]

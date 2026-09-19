@@ -18,6 +18,7 @@ pub use applesauce_core::compressor;
 
 mod rfork_storage;
 mod scan;
+mod scratch;
 mod seq_queue;
 mod threads;
 mod times;
@@ -191,6 +192,20 @@ impl FileCompressor {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stage compression or decompression output in an existing directory before copying it to
+    /// destination-volume temporary files, one file at a time.
+    ///
+    /// `limit` bounds reserved payload bytes, including work in progress.
+    /// Files whose worst-case output exceeds it are left unchanged. Filesystem
+    /// overhead and destination temporary files are not included in this limit.
+    /// Decompression reserves each file's full uncompressed size.
+    pub fn with_scratch(directory: impl AsRef<Path>, limit: u64) -> io::Result<Self> {
+        let scratch = std::sync::Arc::new(scratch::Scratch::new(directory.as_ref(), limit)?);
+        Ok(Self {
+            bg_threads: BackgroundThreads::with_scratch(Some(scratch)),
+        })
     }
 
     #[tracing::instrument(skip_all)]
@@ -538,5 +553,206 @@ mod tests {
 
         assert!(!info::get(&orig_file).unwrap().is_compressed);
         assert!(!info::get(&second_file).unwrap().is_compressed);
+    }
+
+    #[derive(Clone, Default)]
+    struct ScratchProgress {
+        errors: std::sync::Arc<Mutex<Vec<String>>>,
+        paths: std::sync::Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl Task for ScratchProgress {
+        fn increment(&self, _amt: u64) {}
+        fn error(&self, message: &str) {
+            self.errors.lock().unwrap().push(message.to_owned());
+        }
+    }
+
+    impl Progress for ScratchProgress {
+        type Task = Self;
+        fn error(&self, path: &Path, message: &str) {
+            Task::error(self, &format!("{}: {message}", path.display()));
+        }
+        fn file_task(&self, path: &Path, _size: u64) -> Self {
+            self.paths.lock().unwrap().push(path.to_owned());
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn scratch_round_trips_all_formats_with_bounded_backlog() {
+        for kind in [Kind::Zlib, Kind::Lzvn, Kind::Lzfse]
+            .into_iter()
+            .filter(|k| k.supported())
+        {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            fs::write(input.path().join("inline"), [b'x'; 256]).unwrap();
+            // Incompressible output exercises multiple 4 MiB destination writes.
+            let mut state = 0x9876_5432_1234_5678_u64;
+            let data: Vec<u8> = (0..5 * 1024 * 1024 + 123)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            for n in 0..3 {
+                fs::write(input.path().join(format!("large-{n}")), &data).unwrap();
+            }
+            let original_file = File::open(input.path().join("large-0")).unwrap();
+            xattr::set(&original_file, c"user.applesauce-test", b"preserved", 0).unwrap();
+            let before = recursive_read(input.path());
+            let progress = ScratchProgress::default();
+            // Only one worst-case large-file reservation fits at a time.
+            let mut compressor =
+                FileCompressor::with_scratch(scratch.path(), 6 * 1024 * 1024).unwrap();
+            let stats =
+                compressor.recursive_compress([input.path()], kind, 1.1, 2, &progress, true);
+            assert!(
+                progress.errors.lock().unwrap().is_empty(),
+                "{:?}",
+                progress.errors.lock().unwrap()
+            );
+            assert_eq!(
+                stats
+                    .compressed_file_count_final
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                4
+            );
+            assert_entries_equal(&before, &recursive_read(input.path()));
+            let file = File::open(input.path().join("large-0")).unwrap();
+            assert_eq!(
+                xattr::read(&file, c"user.applesauce-test")
+                    .unwrap()
+                    .unwrap(),
+                b"preserved"
+            );
+            for name in ["inline", "large-0"] {
+                let file = File::open(input.path().join(name)).unwrap();
+                let attr = xattr::read(&file, applesauce_core::decmpfs::XATTR_NAME)
+                    .unwrap()
+                    .unwrap();
+                let value = applesauce_core::decmpfs::Value::from_data(&attr).unwrap();
+                let (_, storage) = value.compression_type.compression_storage().unwrap();
+                assert_eq!(
+                    storage,
+                    if name == "inline" {
+                        applesauce_core::decmpfs::Storage::Xattr
+                    } else {
+                        applesauce_core::decmpfs::Storage::ResourceFork
+                    }
+                );
+            }
+            for manual in [false, true] {
+                if manual {
+                    compressor.recursive_compress([input.path()], kind, 1.1, 2, &progress, true);
+                }
+                let stats =
+                    compressor.recursive_decompress([input.path()], manual, &progress, true);
+                assert!(
+                    progress.errors.lock().unwrap().is_empty(),
+                    "{:?}",
+                    progress.errors.lock().unwrap()
+                );
+                assert_eq!(
+                    stats
+                        .compressed_file_count_final
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0
+                );
+                assert_entries_equal(&before, &recursive_read(input.path()));
+                let file = File::open(input.path().join("large-0")).unwrap();
+                assert_eq!(
+                    xattr::read(&file, c"user.applesauce-test")
+                        .unwrap()
+                        .unwrap(),
+                    b"preserved"
+                );
+                for name in ["inline", "large-0"] {
+                    let file = File::open(input.path().join(name)).unwrap();
+                    assert!(xattr::read(&file, applesauce_core::decmpfs::XATTR_NAME)
+                        .unwrap()
+                        .is_none());
+                    assert!(xattr::read(&file, resource_fork::XATTR_NAME)
+                        .unwrap()
+                        .is_none());
+                }
+            }
+            drop(compressor);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn scratch_skips_oversized_reservations_and_its_own_directory() {
+        let input = TempDir::new().unwrap();
+        let small = input.path().join("small");
+        let large = input.path().join("large");
+        fs::write(&small, b"small contents").unwrap();
+        fs::write(&large, vec![7; 256 * 1024]).unwrap();
+        let progress = ScratchProgress::default();
+        let mut compressor = FileCompressor::with_scratch(input.path(), 128 * 1024).unwrap();
+        // Add a compressible file under the private scratch directory: it must
+        // never be visited, even when scratch storage is inside the input tree.
+        let private_dir = fs::read_dir(input.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|p| p.is_dir())
+            .unwrap();
+        fs::write(private_dir.join("must-not-compress"), vec![0; 8192]).unwrap();
+        compressor.recursive_compress([input.path()], Kind::default(), 2.0, 2, &progress, true);
+        assert_eq!(progress.paths.lock().unwrap().len(), 2);
+        let errors = progress.errors.lock().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("scratch limit"));
+        assert_eq!(fs::read(&large).unwrap(), vec![7; 256 * 1024]);
+        assert!(!info::get(&large).unwrap().is_compressed);
+        assert!(info::get(&small).unwrap().is_compressed);
+        drop(compressor);
+        assert!(!private_dir.exists());
+    }
+
+    #[test]
+    fn invalid_scratch_directory_and_limit_fail_before_compression() {
+        let input = TempDir::new().unwrap();
+        assert!(FileCompressor::with_scratch(input.path().join("missing"), 1024).is_err());
+        assert!(FileCompressor::with_scratch(input.path(), 0).is_err());
+        assert_eq!(fs::read_dir(input.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn scratch_decompression_reserves_uncompressed_size_with_exact_limit() {
+        for manual in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let exact = input.path().join("exact");
+            let oversized = input.path().join("oversized");
+            fs::write(&exact, vec![0; 128 * 1024]).unwrap();
+            fs::write(&oversized, vec![0; 128 * 1024 + 1]).unwrap();
+            FileCompressor::new().recursive_compress(
+                [input.path()],
+                Kind::default(),
+                0.95,
+                2,
+                &NoProgress,
+                true,
+            );
+            assert!(info::get(&exact).unwrap().is_compressed);
+            assert!(info::get(&oversized).unwrap().is_compressed);
+            let progress = ScratchProgress::default();
+            let mut compressor = FileCompressor::with_scratch(scratch.path(), 128 * 1024).unwrap();
+            compressor.recursive_decompress([input.path()], manual, &progress, true);
+            let errors = progress.errors.lock().unwrap();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].contains("scratch limit"));
+            assert!(!info::get(&exact).unwrap().is_compressed);
+            assert!(info::get(&oversized).unwrap().is_compressed);
+            assert_eq!(fs::read(exact).unwrap(), vec![0; 128 * 1024]);
+            assert_eq!(fs::read(oversized).unwrap(), vec![0; 128 * 1024 + 1]);
+            drop(compressor);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
     }
 }

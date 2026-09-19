@@ -68,6 +68,48 @@ To print one aggregate summary for multiple paths, run:
 applesauce info --summary path/to/first path/to/second
 ```
 
+### Scratch storage for slower destinations
+
+Use `--scratch DIR` with `compress` or `decompress` to stage output on a fast disk
+before copying completed files to a slower destination:
+
+```console
+cd /Volumes/SLOWER
+applesauce compress --scratch="$TMPDIR" .
+applesauce compress --scratch="$TMPDIR" --scratch-limit=32GiB --verify .
+applesauce decompress --scratch="$TMPDIR" .
+applesauce decompress --scratch="$TMPDIR" --scratch-limit=32GiB --manual --verify .
+```
+
+Compression workers stage encoded payloads; decompression workers stage ordinary
+uncompressed data. Both use a private temporary directory under `DIR`.
+One copy worker transfers completed payloads in sequential chunks of up to 4 MiB
+to temporary files on the destination volume, then atomically
+renames each completed file over its original. The scratch directory need not
+support APFS compression. Destination files still require a filesystem that
+supports transparent compression for compression operations. With `--verify`,
+the destination temporary file is read back and compared with the original before
+replacement. Decompression supports both the default OS decoder and `--manual`;
+manual verification also decodes the original manually.
+
+The default scratch limit is **16 GiB**. `--scratch-limit` accepts positive
+integer byte counts, decimal units such as `16GB`, and binary units such as
+`16GiB`. The limit covers active reservations and completed outputs, excluding
+filesystem allocation/metadata overhead and destination temporary files. Before
+reading a file, Applesauce reserves its worst-case compressed size, including
+format overhead, or its full uncompressed size for decompression. It waits when
+the remaining budget is insufficient, then reduces the reservation to the actual
+size when compression finishes. Space is
+released after copying and deleting the scratch payload. A file whose full
+reservation exceeds the limit is left unchanged with an error; increase the
+limit to process it.
+
+Scratch storage is removed on normal completion. Reads from the destination
+can still overlap with the copy worker's writes. Filesystem allocation and
+writeback determine physical disk access, so performance gains depend on the
+device and workload. Without `--scratch`, Applesauce uses its existing streaming
+pipeline.
+
 ## Features
 
 Applesauce has the following key features:

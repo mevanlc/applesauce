@@ -1,5 +1,6 @@
 use crate::info::{FileCompressionState, FileInfo, IncompressibleReason};
 use crate::progress::{self, Progress, SkipReason};
+use crate::scratch::Scratch;
 use crate::volumes::Volumes;
 use crate::{info, scan, times, Stats};
 use applesauce_core::compressor;
@@ -39,6 +40,8 @@ pub struct BackgroundThreads {
     reader: BgWorker<reader::Work>,
     _compressor: BgWorker<compressing::Work>,
     _writer: BgWorker<writer::Work>,
+    _publisher: Option<BgWorker<writer::Publish>>,
+    scratch: Option<Arc<Scratch>>,
 }
 
 #[derive(Debug)]
@@ -48,6 +51,7 @@ pub struct OperationContext {
     finished_stats: crossbeam_channel::Sender<Stats>,
     volumes: Volumes,
     verify: bool,
+    scratch: Option<Arc<Scratch>>,
 }
 
 impl OperationContext {
@@ -56,6 +60,7 @@ impl OperationContext {
         finished_stats: crossbeam_channel::Sender<Stats>,
         volumes: Volumes,
         verify: bool,
+        scratch: Option<Arc<Scratch>>,
     ) -> Self {
         Self {
             mode,
@@ -63,11 +68,16 @@ impl OperationContext {
             finished_stats,
             volumes,
             verify,
+            scratch,
         }
     }
 
     pub fn is_temp_dir(&self, path: &Path) -> bool {
         self.volumes.is_temp_dir(path)
+            || self
+                .scratch
+                .as_ref()
+                .is_some_and(|scratch| scratch.is_temp_dir(path))
     }
 }
 
@@ -141,12 +151,22 @@ impl Mode {
 impl BackgroundThreads {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_scratch(None)
+    }
+
+    pub(crate) fn with_scratch(scratch: Option<Arc<Scratch>>) -> Self {
         let compressor_threads = thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1);
 
         let compressor = BgWorker::new(compressor_threads, &compressing::Work);
-        let writer = BgWorker::new(16, &writer::Work);
+        let publisher = scratch.as_ref().map(|_| BgWorker::new(1, &writer::Publish));
+        let writer = BgWorker::new(
+            16,
+            &writer::Work {
+                publisher: publisher.as_ref().map(|p| p.chan().clone()),
+            },
+        );
         let reader = BgWorker::new(
             8,
             &reader::Work {
@@ -158,6 +178,8 @@ impl BackgroundThreads {
             reader,
             _compressor: compressor,
             _writer: writer,
+            _publisher: publisher,
+            scratch,
         }
     }
 
@@ -187,7 +209,13 @@ impl BackgroundThreads {
             }
             walker.add_path(path);
         }
-        let operation = Arc::new(OperationContext::new(mode, finished_stats, volumes, verify));
+        let operation = Arc::new(OperationContext::new(
+            mode,
+            finished_stats,
+            volumes,
+            verify,
+            self.scratch.as_ref().map(Arc::clone),
+        ));
         let stats = &operation.stats;
         let chan = self.reader.chan();
 
