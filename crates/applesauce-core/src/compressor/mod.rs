@@ -6,6 +6,9 @@ use self::lzfse::Lzfse;
 #[cfg(feature = "zlib")]
 use self::zlib::Zlib;
 use crate::decmpfs::BlockInfo;
+
+mod encoder;
+pub use encoder::{Encoder, LzfseBackend};
 use std::{fmt, io};
 
 #[cfg(any(feature = "lzfse", feature = "lzvn"))]
@@ -65,7 +68,12 @@ impl Compressor {
             #[cfg(feature = "zlib")]
             Data::Zlib(_) => Kind::Zlib,
             #[cfg(feature = "lzfse")]
-            Data::Lzfse(_) => Kind::Lzfse,
+            Data::Lzfse(_)
+            | Data::LzfseCrate(_)
+            | Data::LzfseVendor(_)
+            | Data::LzfseVendorUltra(_) => Kind::Lzfse,
+            #[cfg(all(feature = "lzfse", target_os = "macos"))]
+            Data::LzfseMacos(_) => Kind::Lzfse,
             #[cfg(feature = "lzvn")]
             Data::Lzvn(_) => Kind::Lzvn,
         }
@@ -77,6 +85,14 @@ enum Data {
     Zlib(Zlib),
     #[cfg(feature = "lzfse")]
     Lzfse(Lzfse),
+    #[cfg(feature = "lzfse")]
+    LzfseCrate(lzfse::Crate),
+    #[cfg(feature = "lzfse")]
+    LzfseVendor(lzfse::Vendor),
+    #[cfg(feature = "lzfse")]
+    LzfseVendorUltra(lzfse::VendorUltra),
+    #[cfg(all(feature = "lzfse", target_os = "macos"))]
+    LzfseMacos(lzfse::Macos),
     #[cfg(feature = "lzvn")]
     Lzvn(Lzvn),
 }
@@ -93,6 +109,14 @@ impl Compressor {
             Data::Zlib(ref mut i) => i.compress(dst, src, level),
             #[cfg(feature = "lzfse")]
             Data::Lzfse(ref mut i) => i.compress(dst, src, level),
+            #[cfg(feature = "lzfse")]
+            Data::LzfseCrate(ref mut i) => i.compress(dst, src, level),
+            #[cfg(feature = "lzfse")]
+            Data::LzfseVendor(ref mut i) => i.compress(dst, src, level),
+            #[cfg(feature = "lzfse")]
+            Data::LzfseVendorUltra(ref mut i) => i.compress(dst, src, level),
+            #[cfg(all(feature = "lzfse", target_os = "macos"))]
+            Data::LzfseMacos(ref mut i) => i.compress(dst, src, level),
             #[cfg(feature = "lzvn")]
             Data::Lzvn(ref mut i) => i.compress(dst, src, level),
         }
@@ -104,6 +128,14 @@ impl Compressor {
             Data::Zlib(ref mut i) => i.decompress(dst, src),
             #[cfg(feature = "lzfse")]
             Data::Lzfse(ref mut i) => i.decompress(dst, src),
+            #[cfg(feature = "lzfse")]
+            Data::LzfseCrate(ref mut i) => i.decompress(dst, src),
+            #[cfg(feature = "lzfse")]
+            Data::LzfseVendor(ref mut i) => i.decompress(dst, src),
+            #[cfg(feature = "lzfse")]
+            Data::LzfseVendorUltra(ref mut i) => i.decompress(dst, src),
+            #[cfg(all(feature = "lzfse", target_os = "macos"))]
+            Data::LzfseMacos(ref mut i) => i.decompress(dst, src),
             #[cfg(feature = "lzvn")]
             Data::Lzvn(ref mut i) => i.decompress(dst, src),
         }
@@ -118,7 +150,7 @@ impl Compressor {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Kind {
     Zlib = 0,
@@ -236,7 +268,7 @@ mod tests {
 
     pub(super) fn compressor_round_trip<C: CompressorImpl>(c: &mut C) {
         let mut buf = vec![0u8; PLAINTEXT.len() * 2];
-        let len = c.compress(&mut buf, PLAINTEXT, 6).unwrap();
+        let len = c.compress(&mut buf, PLAINTEXT, 5).unwrap();
         assert!(len > 0);
         assert!(len < buf.len());
         let ciphertext = &buf[..len];

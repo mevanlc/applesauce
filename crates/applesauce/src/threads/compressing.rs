@@ -2,6 +2,7 @@ use crate::scratch::COMPRESSED_BLOCK_CAPACITY;
 use crate::seq_queue;
 use crate::threads::{writer, BgWork, Context, Mode, WorkHandler};
 use applesauce_core::compressor::{self, Compressor};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ impl BgWork for Work {
 
     fn make_handler(&self) -> Self::Handler {
         Handler {
-            compressors: (0..3).map(|_| None).collect(),
+            compressors: HashMap::new(),
             buf: vec![0; COMPRESSED_BLOCK_CAPACITY],
         }
     }
@@ -34,7 +35,7 @@ impl BgWork for Work {
 }
 
 pub(super) struct Handler {
-    compressors: Vec<Option<Compressor>>,
+    compressors: HashMap<compressor::Encoder, Compressor>,
     buf: Vec<u8>,
 }
 
@@ -43,12 +44,17 @@ impl WorkHandler<WorkItem> for Handler {
         let _entered =
             tracing::debug_span!("compressing block", path=%item.context.path.display()).entered();
 
-        // TODO: Unwrap?
-        let compressor = self.compressors[item.kind as usize]
-            .get_or_insert_with(|| item.kind.compressor().unwrap());
+        let encoder = match item.context.operation.mode {
+            Mode::Compress { encoder, .. } => encoder,
+            _ => item.kind.into(),
+        };
+        let compressor = self
+            .compressors
+            .entry(encoder)
+            .or_insert_with(|| encoder.compressor().expect("supported encoder"));
         let size = match item.context.operation.mode {
-            Mode::Compress { kind, level, .. } => {
-                debug_assert_eq!(kind, item.kind);
+            Mode::Compress { encoder, level, .. } => {
+                debug_assert_eq!(encoder.kind(), item.kind);
                 compressor.compress(&mut self.buf, &item.data, level)
             }
             Mode::DecompressManually => compressor.decompress(&mut self.buf, &item.data),

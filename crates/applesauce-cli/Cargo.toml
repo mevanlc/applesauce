@@ -18,6 +18,9 @@ default = ["zlib", "lzfse", "lzvn"]
 zlib = ["applesauce/zlib"]
 lzfse = ["applesauce/lzfse"]
 lzvn = ["applesauce/lzvn"]
+system-lzfse = ["lzfse", "applesauce/system-lzfse"]
+vendor-lzfse = ["lzfse", "applesauce/vendor-lzfse"]
+vendor-ultra-lzfse = ["lzfse", "applesauce/vendor-ultra-lzfse"]
 
 [dependencies]
 applesauce = { version = "^0.8.8", path = "../applesauce", default-features = false }

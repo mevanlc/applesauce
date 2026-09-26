@@ -138,6 +138,58 @@ Depending on the type of data being compressed and the desired balance between
 compression ratio and speed, one of these algorithms may be more suitable than
 the others.
 
+### LZFSE backends
+
+`-c lzfse` selects the file format; `-b, --backend` selects its encoder:
+
+| Backend | Implementation | Tuning |
+| --- | --- | --- |
+| `macos` | Apple's macOS compression library | Fixed |
+| `crate` | Unmodified `lzfse-sys` 2.0.0, compiled and linked statically | Stock |
+| `vendor` | Vendored Apple reference encoder, compiled and linked statically | Stock |
+| `vendor-ultra` | Vendored Apple reference encoder, compiled and linked statically | Higher compression effort, using more time and memory |
+
+All four are included in normal macOS builds. `--backend` is only valid with
+LZFSE; omitting `-c` uses the default algorithm, LZFSE.
+`-l` / `--level` only affects ZLIB, which accepts levels 1-12 and defaults to 5.
+Explicitly specifying a level with any LZFSE backend or with LZVN emits a warning,
+including when specifying `-l5`. Omitting the level emits no warning.
+`-q` keeps this warning visible; `-qq` suppresses it along with the final summary.
+
+```console
+applesauce compress -c lzfse -b macos --verify path
+applesauce compress -c lzfse -b crate --verify path
+applesauce compress -c lzfse -b vendor --verify path
+applesauce compress -c lzfse -b vendor-ultra --verify path
+```
+
+The `vendor-ultra` backend increases hash bits from 14 to 16, hash width from 4
+to 8, and the good-match threshold from 40 to 100. It uses eight times as much
+history-table memory and spends more effort looking for matches. Output may be
+smaller, at a cost in encoding time and memory; higher effort does not guarantee
+smaller output for every file. Both vendor backends have fixed settings unaffected
+by `-l`. Inputs below 4096 bytes retain the reference encoder's LZVN fallback.
+See the [vendor notes](crates/applesauce-core/vendor/lzfse/README.md) for provenance.
+
+All backends write standard LZFSE files readable by macOS and Applesauce's manual
+decoder. The file's compression metadata records LZFSE, not the backend or level.
+Already-compressed files are skipped: decompress a copy first when comparing
+backends. Both streaming output and `--scratch` staging support every backend.
+
+The default backend is `crate`. Build features select a different default while
+keeping every backend available at runtime:
+
+```console
+cargo build --release -p applesauce-cli --features system-lzfse
+cargo build --release -p applesauce-cli --features vendor-lzfse
+cargo build --release -p applesauce-cli --features vendor-ultra-lzfse
+```
+
+`system-lzfse` selects `macos`; `vendor-lzfse` selects `vendor`;
+`vendor-ultra-lzfse` selects `vendor-ultra`. When multiple default-selection
+features are enabled, precedence is `vendor-ultra-lzfse`, then `vendor-lzfse`,
+then `system-lzfse`. Explicit `-b` always overrides the build default.
+
 ## Improvements Over Afsctool
 
 Applesauce is based on afsctool, but offers several key improvements, including:

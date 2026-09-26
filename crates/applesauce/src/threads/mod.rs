@@ -134,7 +134,7 @@ impl Drop for Context {
 #[derive(Debug, Copy, Clone)]
 pub enum Mode {
     Compress {
-        kind: compressor::Kind,
+        encoder: compressor::Encoder,
         minimum_compression_ratio: f64,
         level: u32,
     },

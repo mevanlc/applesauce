@@ -18,8 +18,10 @@ zlib = ["applesauce-core/zlib"]
 lzfse = ["applesauce-core/lzfse"]
 lzvn = ["applesauce-core/lzvn"]
 
-# If specified, takes preceidence over lzfse feature
+# Select the default LZFSE backend; explicit selections remain available.
 system-lzfse = ["lzfse", "applesauce-core/system-lzfse"]
+vendor-lzfse = ["lzfse", "applesauce-core/vendor-lzfse"]
+vendor-ultra-lzfse = ["lzfse", "applesauce-core/vendor-ultra-lzfse"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

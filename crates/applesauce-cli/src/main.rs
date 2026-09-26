@@ -1,5 +1,7 @@
 use crate::progress::{ProgressBarWriter, ProgressBars, Verbosity};
-use applesauce::compressor::Kind;
+#[cfg(feature = "lzfse")]
+use applesauce::compressor::LzfseBackend;
+use applesauce::compressor::{Encoder, Kind};
 use applesauce::{info, Stats};
 use cfg_if::cfg_if;
 use clap::Parser;
@@ -37,7 +39,7 @@ struct Cli {
 
     /// Reduce output
     ///
-    /// Repeat to suppress the final compression summary
+    /// Repeat to suppress the final compression summary and warnings about ignored levels
     #[arg(short, long, global(true), action = clap::ArgAction::Count, conflicts_with = "verbose")]
     quiet: u8,
 }
@@ -94,19 +96,23 @@ struct Decompress {
     scratch_options: ScratchOptions,
 }
 
+const DEFAULT_COMPRESSION_LEVEL: u32 = 5;
+
 #[derive(Debug, clap::Args)]
 struct Compress {
     /// Paths to recursively compress
     #[arg(required = true)]
     paths: Vec<PathBuf>,
 
-    /// The compression level to use
+    /// ZLIB compression level, 1-12 (default: 5)
+    ///
+    /// Specifying a level for LZFSE or LZVN emits a warning because it has no effect,
+    /// unless -qq is used.
     #[arg(
         short, long,
-        default_value_t = 5,
         value_parser = clap::value_parser!(u32).range(1..=12)
     )]
-    level: u32,
+    level: Option<u32>,
 
     /// The minimum compression ratio
     ///
@@ -124,6 +130,11 @@ struct Compress {
     #[arg(short, long, value_enum, default_value_t = Compression::default())]
     compression: Compression,
 
+    /// LZFSE encoder implementation (only valid with -c lzfse)
+    #[cfg(feature = "lzfse")]
+    #[arg(short, long, value_enum, help = backend_help())]
+    backend: Option<Backend>,
+
     /// Verify that the compressed file has the same contents as the original before replacing it
     ///
     /// This is an extra safety check to ensure that the compressed file is exactly the same as the
@@ -133,6 +144,70 @@ struct Compress {
 
     #[command(flatten)]
     scratch_options: ScratchOptions,
+}
+
+impl Compress {
+    fn encoder(&self) -> Result<Encoder, String> {
+        let kind = Kind::from(self.compression);
+        #[cfg(feature = "lzfse")]
+        let encoder = match self.backend {
+            Some(backend) if kind == Kind::Lzfse => Encoder::lzfse(backend.into()),
+            Some(_) => return Err("--backend is only valid with -c lzfse".to_owned()),
+            None => kind.into(),
+        };
+        #[cfg(not(feature = "lzfse"))]
+        let encoder = Encoder::from(kind);
+        Ok(encoder)
+    }
+}
+
+#[cfg(feature = "lzfse")]
+fn backend_help() -> String {
+    use clap::ValueEnum;
+    format!(
+        "LZFSE encoder implementation (LZFSE only; default: {})",
+        Backend::default().to_possible_value().unwrap().get_name()
+    )
+}
+
+#[cfg(feature = "lzfse")]
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
+enum Backend {
+    /// Apple's macOS compression library
+    #[cfg(target_os = "macos")]
+    Macos,
+    /// Unmodified lzfse-sys encoder
+    Crate,
+    /// Vendored encoder with stock settings
+    Vendor,
+    /// Vendored encoder tuned for higher compression, using more time and memory
+    VendorUltra,
+}
+
+#[cfg(feature = "lzfse")]
+impl From<Backend> for LzfseBackend {
+    fn from(backend: Backend) -> Self {
+        match backend {
+            #[cfg(target_os = "macos")]
+            Backend::Macos => Self::Macos,
+            Backend::Crate => Self::Crate,
+            Backend::Vendor => Self::Vendor,
+            Backend::VendorUltra => Self::VendorUltra,
+        }
+    }
+}
+
+#[cfg(feature = "lzfse")]
+impl Default for Backend {
+    fn default() -> Self {
+        match LzfseBackend::default() {
+            #[cfg(target_os = "macos")]
+            LzfseBackend::Macos => Self::Macos,
+            LzfseBackend::Vendor => Self::Vendor,
+            LzfseBackend::VendorUltra => Self::VendorUltra,
+            _ => Self::Crate,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -273,6 +348,14 @@ fn chrome_tracing_file(path: Option<&Path>) -> Option<impl io::Write> {
 
 fn main() {
     let cli = Cli::parse();
+    if let Commands::Compress(options) = &cli.command {
+        if let Err(message) = options.encoder() {
+            use clap::CommandFactory;
+            Cli::command()
+                .error(clap::error::ErrorKind::ValueValidation, message)
+                .exit();
+        }
+    }
     let verbosity = cli.verbosity();
     let show_compression_summary = cli.show_compression_summary();
 
@@ -311,26 +394,27 @@ fn main() {
         .init();
 
     match cli.command {
-        Commands::Compress(Compress {
-            paths,
-            compression,
-            minimum_compression_ratio,
-            level,
-            verify,
-            scratch_options,
-        }) => {
-            let kind: Kind = compression.into();
+        Commands::Compress(options) => {
+            let encoder = options.encoder().expect("validated compression options");
+            let Compress {
+                paths,
+                minimum_compression_ratio,
+                level,
+                verify,
+                scratch_options,
+                ..
+            } = options;
 
-            if kind != Kind::Zlib && level != 5 {
-                tracing::warn!("Compression level is ignored for non-zlib compression");
+            if let Some(level) = level.filter(|_| cli.quiet < 2 && !encoder.supports_level()) {
+                eprintln!("Warning: --level {level} has no effect for the selected encoder");
             }
 
             let mut compressor = scratch_options.file_compressor();
             let stats = compressor.recursive_compress(
                 paths.iter().map(Path::new),
-                kind,
+                encoder,
                 minimum_compression_ratio,
-                level,
+                level.unwrap_or(DEFAULT_COMPRESSION_LEVEL),
                 &progress_bars,
                 verify,
             );
@@ -773,6 +857,57 @@ fn truncate_single_segment() {
 fn command_check() {
     use clap::CommandFactory;
     Cli::command().debug_assert()
+}
+
+#[cfg(feature = "lzfse")]
+#[test]
+fn lzfse_backend_and_level_selection() {
+    let mut backends = vec![
+        ("crate", LzfseBackend::Crate),
+        ("vendor", LzfseBackend::Vendor),
+        ("vendor-ultra", LzfseBackend::VendorUltra),
+    ];
+    #[cfg(target_os = "macos")]
+    backends.push(("macos", LzfseBackend::Macos));
+    for (name, backend) in backends {
+        let cli = Cli::try_parse_from(["applesauce", "compress", "-c", "lzfse", "-b", name, "."])
+            .unwrap();
+        let Commands::Compress(options) = cli.command else {
+            panic!()
+        };
+        assert_eq!(options.encoder().unwrap(), Encoder::lzfse(backend));
+    }
+    for (args, valid) in [
+        (vec!["-b", "vendor", "-l9"], true),
+        (vec!["-b", "vendor-ultra"], true),
+        (vec![], true),
+    ] {
+        let cli =
+            Cli::try_parse_from(["applesauce", "compress", "."].into_iter().chain(args)).unwrap();
+        let Commands::Compress(options) = cli.command else {
+            panic!()
+        };
+        assert_eq!(options.encoder().is_ok(), valid);
+        if options.backend.is_none() {
+            assert_eq!(
+                options.encoder().unwrap(),
+                Encoder::lzfse(LzfseBackend::default())
+            );
+        }
+    }
+    #[cfg(feature = "zlib")]
+    {
+        let cli =
+            Cli::try_parse_from(["applesauce", "compress", "-c", "zlib", "-b", "vendor", "."])
+                .unwrap();
+        let Commands::Compress(options) = cli.command else {
+            panic!()
+        };
+        assert!(options
+            .encoder()
+            .unwrap_err()
+            .contains("only valid with -c lzfse"));
+    }
 }
 
 #[test]

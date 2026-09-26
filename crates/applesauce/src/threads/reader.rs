@@ -49,7 +49,8 @@ impl Handler {
         tx: &seq_queue::Sender<writer::Chunk, io::Error>,
     ) -> io::Result<()> {
         match context.operation.mode {
-            Mode::Compress { kind, .. } => {
+            Mode::Compress { encoder, .. } => {
+                let kind = encoder.kind();
                 let compressor = self.compressor.clone();
                 self.with_file_chunks(file, expected_len, tx, |slot, data| {
                     let _enter = tracing::debug_span!("waiting to send to compressor").entered();
@@ -176,7 +177,7 @@ impl WorkHandler<WorkItem> for Handler {
                 context.progress.phase("Waiting for scratch space");
                 let size = context.orig_metadata.len();
                 let reservation = match context.operation.mode {
-                    Mode::Compress { kind, .. } => scratch.reserve(kind, size),
+                    Mode::Compress { encoder, .. } => scratch.reserve(encoder.kind(), size),
                     Mode::DecompressManually | Mode::DecompressByReading => {
                         scratch.reserve_uncompressed(size)
                     }

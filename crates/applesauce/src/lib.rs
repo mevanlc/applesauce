@@ -39,6 +39,7 @@ use tracing::warn;
 use crate::info::{FileCompressionState, FileInfo};
 use crate::progress::Progress;
 use crate::threads::{BackgroundThreads, Mode};
+#[cfg(test)]
 use applesauce_core::compressor::Kind;
 
 const fn c_char_bytes(chars: &[c_char]) -> &[u8] {
@@ -212,7 +213,7 @@ impl FileCompressor {
     pub fn recursive_compress<'a, P>(
         &mut self,
         paths: impl IntoIterator<Item = &'a Path>,
-        kind: Kind,
+        encoder: impl Into<compressor::Encoder>,
         minimum_compression_ratio: f64,
         level: u32,
         progress: &P,
@@ -224,7 +225,7 @@ impl FileCompressor {
     {
         self.bg_threads.scan(
             Mode::Compress {
-                kind,
+                encoder: encoder.into(),
                 level,
                 minimum_compression_ratio,
             },
@@ -420,7 +421,7 @@ mod tests {
         let old_contents = recursive_read(dir);
 
         let mut fc = FileCompressor::new();
-        fc.recursive_compress(iter::once(dir), compressor_kind, 1.0, 2, &NoProgress, true);
+        fc.recursive_compress(iter::once(dir), compressor_kind, 1.0, 5, &NoProgress, true);
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let new_contents = recursive_read(dir);
@@ -462,7 +463,7 @@ mod tests {
             iter::once(compressible_file.path()),
             Kind::default(),
             1.0,
-            2,
+            5,
             &NoProgress,
             true,
         );
@@ -494,7 +495,7 @@ mod tests {
             [inner_dir.as_path(), inner_file_path.as_path()],
             Kind::default(),
             1.0,
-            2,
+            5,
             &NoProgress,
             false,
         );
@@ -542,7 +543,7 @@ mod tests {
 
         let orig_contents = recursive_read(dir.path());
         let mut fc = FileCompressor::new();
-        fc.recursive_compress([dir.path()], Kind::default(), 2.0, 2, &progress, false);
+        fc.recursive_compress([dir.path()], Kind::default(), 2.0, 5, &progress, false);
         let next_contents = recursive_read(dir.path());
         assert_entries_equal(&orig_contents, &next_contents);
 
@@ -609,7 +610,7 @@ mod tests {
             let mut compressor =
                 FileCompressor::with_scratch(scratch.path(), 6 * 1024 * 1024).unwrap();
             let stats =
-                compressor.recursive_compress([input.path()], kind, 1.1, 2, &progress, true);
+                compressor.recursive_compress([input.path()], kind, 1.1, 5, &progress, true);
             assert!(
                 progress.errors.lock().unwrap().is_empty(),
                 "{:?}",
@@ -647,7 +648,7 @@ mod tests {
             }
             for manual in [false, true] {
                 if manual {
-                    compressor.recursive_compress([input.path()], kind, 1.1, 2, &progress, true);
+                    compressor.recursive_compress([input.path()], kind, 1.1, 5, &progress, true);
                 }
                 let stats =
                     compressor.recursive_decompress([input.path()], manual, &progress, true);
@@ -685,6 +686,75 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lzfse")]
+    #[test]
+    fn lzfse_backends_round_trip_through_both_storage_pipelines() {
+        use compressor::{Encoder, LzfseBackend};
+        use std::sync::atomic::Ordering;
+        let source = include_bytes!("threads/writer.rs");
+        let data: Vec<u8> = source.iter().copied().cycle().take(160_000).collect();
+        for staged in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            // Reuse workers while changing backend and decoding mode.
+            let mut compressor = if staged {
+                FileCompressor::with_scratch(scratch.path(), 1024 * 1024).unwrap()
+            } else {
+                FileCompressor::new()
+            };
+            for backend in [
+                LzfseBackend::Macos,
+                LzfseBackend::Crate,
+                LzfseBackend::VendorUltra,
+                LzfseBackend::Vendor,
+            ] {
+                for manual in [false, true] {
+                    fs::write(input.path().join("inline"), [b'x'; 256]).unwrap();
+                    fs::write(input.path().join("large"), &data).unwrap();
+                    let progress = ScratchProgress::default();
+                    let stats = compressor.recursive_compress(
+                        [input.path()],
+                        Encoder::lzfse(backend),
+                        1.0,
+                        5,
+                        &progress,
+                        true,
+                    );
+                    assert!(
+                        progress.errors.lock().unwrap().is_empty(),
+                        "{:?}",
+                        progress.errors.lock().unwrap()
+                    );
+                    assert_eq!(stats.compressed_file_count_final.load(Ordering::Relaxed), 2);
+                    assert_eq!(fs::read(input.path().join("large")).unwrap(), data);
+                    for (name, expected_storage) in [
+                        ("inline", applesauce_core::decmpfs::Storage::Xattr),
+                        ("large", applesauce_core::decmpfs::Storage::ResourceFork),
+                    ] {
+                        let info = info::get(&input.path().join(name)).unwrap();
+                        let decmpfs = info.decmpfs_info.unwrap().unwrap();
+                        assert_eq!(
+                            decmpfs.compression_type.compression_storage(),
+                            Some((Kind::Lzfse, expected_storage))
+                        );
+                    }
+                    let stats =
+                        compressor.recursive_decompress([input.path()], manual, &progress, true);
+                    assert!(
+                        progress.errors.lock().unwrap().is_empty(),
+                        "{:?}",
+                        progress.errors.lock().unwrap()
+                    );
+                    assert_eq!(stats.compressed_file_count_final.load(Ordering::Relaxed), 0);
+                    assert_eq!(fs::read(input.path().join("large")).unwrap(), data);
+                    assert_eq!(fs::read(input.path().join("inline")).unwrap(), [b'x'; 256]);
+                }
+            }
+            drop(compressor);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn scratch_skips_oversized_reservations_and_its_own_directory() {
         let input = TempDir::new().unwrap();
@@ -702,7 +772,7 @@ mod tests {
             .find(|p| p.is_dir())
             .unwrap();
         fs::write(private_dir.join("must-not-compress"), vec![0; 8192]).unwrap();
-        compressor.recursive_compress([input.path()], Kind::default(), 2.0, 2, &progress, true);
+        compressor.recursive_compress([input.path()], Kind::default(), 2.0, 5, &progress, true);
         assert_eq!(progress.paths.lock().unwrap().len(), 2);
         let errors = progress.errors.lock().unwrap();
         assert_eq!(errors.len(), 1, "{errors:?}");
@@ -735,7 +805,7 @@ mod tests {
                 [input.path()],
                 Kind::default(),
                 0.95,
-                2,
+                5,
                 &NoProgress,
                 true,
             );

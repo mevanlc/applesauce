@@ -119,6 +119,7 @@ dependencies = [
 name = "applesauce-core"
 version = "0.4.12"
 dependencies = [
+ "cc",
  "criterion",
  "libc",
  "libdeflater",

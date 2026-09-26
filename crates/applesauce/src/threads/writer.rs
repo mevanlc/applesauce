@@ -311,7 +311,7 @@ impl WorkHandler<WorkItem> for Handler {
 
         if context.operation.scratch.is_some() {
             let result = match context.operation.mode {
-                Mode::Compress { kind, .. } => self.stage_compressed_file(item, kind),
+                Mode::Compress { encoder, .. } => self.stage_compressed_file(item, encoder.kind()),
                 Mode::DecompressManually | Mode::DecompressByReading => {
                     self.stage_uncompressed_file(item)
                 }
@@ -325,7 +325,7 @@ impl WorkHandler<WorkItem> for Handler {
         }
 
         let res = match context.operation.mode {
-            Mode::Compress { kind, .. } => self.write_compressed_file(item, kind),
+            Mode::Compress { encoder, .. } => self.write_compressed_file(item, encoder.kind()),
             Mode::DecompressManually | Mode::DecompressByReading => {
                 self.write_uncompressed_file(item)
             }
@@ -608,9 +608,9 @@ mod tests {
             parent_resetter: None,
             operation: Arc::new(OperationContext::new(
                 Mode::Compress {
-                    kind,
+                    encoder: kind.into(),
                     minimum_compression_ratio: 0.95,
-                    level: 2,
+                    level: 5,
                 },
                 finished_stats,
                 volumes,
@@ -632,7 +632,7 @@ mod tests {
         let mut compressor = kind.compressor().unwrap();
         let mut buffer = vec![0; crate::scratch::COMPRESSED_BLOCK_CAPACITY];
         for data in original.chunks(applesauce_core::BLOCK_SIZE) {
-            let len = compressor.compress(&mut buffer, data, 2).unwrap();
+            let len = compressor.compress(&mut buffer, data, 5).unwrap();
             tx.prepare_send()
                 .unwrap()
                 .finish(Chunk {
