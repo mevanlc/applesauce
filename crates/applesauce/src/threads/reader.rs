@@ -1,4 +1,6 @@
+use crate::scratch::Reservation;
 use crate::seq_queue::Slot;
+use crate::threads::batching::Completion;
 use crate::threads::{compressing, writer, BgWork, Context, Mode, WorkHandler};
 use crate::{rfork_storage, seq_queue, try_read_all};
 use applesauce_core::BLOCK_SIZE;
@@ -9,6 +11,8 @@ use std::{io, thread};
 
 pub(super) struct WorkItem {
     pub context: Arc<Context>,
+    pub reservation: Option<Reservation>,
+    pub completion: Option<Completion>,
 }
 
 pub(super) struct Work {
@@ -170,10 +174,15 @@ impl Handler {
 
 impl WorkHandler<WorkItem> for Handler {
     fn handle_item(&mut self, item: WorkItem) {
-        let WorkItem { context } = item;
+        let WorkItem {
+            context,
+            reservation,
+            completion,
+        } = item;
         let _guard = tracing::info_span!("reading file", path=%context.path.display()).entered();
-        let reservation = match &context.operation.scratch {
-            Some(scratch) => {
+        let reservation = match (reservation, &context.operation.scratch) {
+            (Some(reservation), _) => Some(reservation),
+            (None, Some(scratch)) => {
                 context.progress.phase("Waiting for scratch space");
                 let size = context.orig_metadata.len();
                 let reservation = match context.operation.mode {
@@ -229,6 +238,7 @@ impl WorkHandler<WorkItem> for Handler {
                     file: Arc::clone(&file),
                     blocks: rx,
                     reservation,
+                    completion: completion.clone(),
                 })
                 .unwrap();
         }

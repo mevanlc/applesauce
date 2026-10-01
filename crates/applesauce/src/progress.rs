@@ -34,6 +34,12 @@ pub trait Progress {
     fn error(&self, path: &Path, message: &str);
     fn file_skipped(&self, _path: &Path, _why: SkipReason) {}
     fn file_task(&self, path: &Path, size: u64) -> Self::Task;
+
+    /// Track destination bytes for one scratch batch, including encoded metadata.
+    /// The task remains alive through the final destination-volume flush.
+    fn scratch_batch_task(&self, _size: u64) -> Option<Box<dyn Task + Send + Sync>> {
+        None
+    }
 }
 
 pub trait Task {
@@ -56,6 +62,10 @@ impl<P: Progress> Progress for &'_ P {
 
     fn file_task(&self, path: &Path, size: u64) -> Self::Task {
         P::file_task(self, path, size)
+    }
+
+    fn scratch_batch_task(&self, size: u64) -> Option<Box<dyn Task + Send + Sync>> {
+        P::scratch_batch_task(self, size)
     }
 }
 

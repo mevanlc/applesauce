@@ -1,4 +1,6 @@
+use crate::progress::Task;
 use crate::scratch::Reservation;
+use crate::threads::batching::Completion;
 use crate::threads::{BgWork, Context, Mode, WorkHandler};
 use crate::{seq_queue, set_flags, times, xattr};
 use applesauce_core::compressor::Kind;
@@ -8,9 +10,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt;
+use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 use std::{cmp, io, ptr};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 
 pub(super) type Sender = crossbeam_channel::Sender<WorkItem>;
 
@@ -24,6 +27,7 @@ pub(super) struct WorkItem {
     pub file: Arc<File>,
     pub blocks: seq_queue::Receiver<Chunk, io::Error>,
     pub reservation: Option<Reservation>,
+    pub completion: Option<Completion>,
 }
 
 pub(super) struct Work {
@@ -117,6 +121,7 @@ impl Handler {
             &mut item.file,
             tmp_file,
             &self.decomp_xattr_val_buf,
+            None,
         )
     }
 
@@ -135,13 +140,22 @@ impl Handler {
         let mut decmpfs_data = Vec::new();
         writer.finish_decmpfs_data(&mut decmpfs_data)?;
         reservation.shrink_to(payload.as_file().metadata()?.len() + decmpfs_data.len() as u64);
-        self.send_staged(StagedFile {
-            payload,
-            reservation,
-            file: item.file,
-            contents: StagedContents::Compressed(decmpfs_data),
-            context: item.context,
-        })
+        self.send_staged(
+            StagedFile {
+                payload: payload.into_temp_path(),
+                reservation,
+                file: if item.completion.is_some() {
+                    None
+                } else {
+                    Some(item.file)
+                },
+                contents: StagedContents::Compressed(decmpfs_data),
+                context: item.context,
+                finished: None,
+                batch_progress: None,
+            },
+            item.completion,
+        )
     }
 
     fn stage_uncompressed_file(&mut self, mut item: WorkItem) -> io::Result<()> {
@@ -152,17 +166,30 @@ impl Handler {
         let scratch = item.context.operation.scratch.as_ref().unwrap();
         let mut payload = scratch.tempfile()?;
         write_uncompressed_blocks(&item.context, &mut payload, item.blocks)?;
-        self.send_staged(StagedFile {
-            payload,
-            reservation,
-            file: item.file,
-            contents: StagedContents::Uncompressed,
-            context: item.context,
-        })
+        self.send_staged(
+            StagedFile {
+                payload: payload.into_temp_path(),
+                reservation,
+                file: if item.completion.is_some() {
+                    None
+                } else {
+                    Some(item.file)
+                },
+                contents: StagedContents::Uncompressed,
+                context: item.context,
+                finished: None,
+                batch_progress: None,
+            },
+            item.completion,
+        )
     }
 
-    fn send_staged(&self, item: StagedFile) -> io::Result<()> {
+    fn send_staged(&self, item: StagedFile, completion: Option<Completion>) -> io::Result<()> {
         item.context.progress.phase("Waiting to copy");
+        if let Some(completion) = completion {
+            completion.finish(item);
+            return Ok(());
+        }
         self.publisher
             .as_ref()
             .unwrap()
@@ -222,10 +249,14 @@ fn finish_compressed_file(
     original: &mut Arc<File>,
     mut tmp_file: NamedTempFile,
     decmpfs_data: &[u8],
+    batch_progress: Option<&(dyn Task + Send + Sync)>,
 ) -> io::Result<()> {
     {
         let _entered = tracing::debug_span!("set decmpfs xattr").entered();
         xattr::set(tmp_file.as_file(), decmpfs::XATTR_NAME, decmpfs_data, 0)?;
+        if let Some(progress) = batch_progress {
+            progress.increment(decmpfs_data.len() as u64);
+        }
     }
 
     copy_metadata(original, tmp_file.as_file())?;
@@ -349,13 +380,21 @@ impl WorkHandler<WorkItem> for Handler {
 }
 
 // Drop the payload before releasing its space reservation, and keep the context
-// (which owns the scratch directory and completion notification) alive until last.
+// (which owns the scratch directory) alive through cleanup, before acknowledging completion.
 pub(super) struct StagedFile {
-    payload: NamedTempFile,
+    payload: TempPath,
     reservation: Reservation,
-    file: Arc<File>,
+    file: Option<Arc<File>>,
     contents: StagedContents,
-    context: Arc<Context>,
+    pub(super) context: Arc<Context>,
+    pub(super) finished: Option<crossbeam_channel::Sender<()>>,
+    pub(super) batch_progress: Option<Arc<dyn Task + Send + Sync>>,
+}
+
+impl StagedFile {
+    pub(super) fn publish_size(&self) -> u64 {
+        self.reservation.size()
+    }
 }
 
 enum StagedContents {
@@ -395,17 +434,35 @@ impl PublishHandler {
             .operation
             .volumes
             .tempfile_for(&context.path, &context.orig_metadata)?;
-        copy_xattrs(&item.file, tmp_file.as_file())?;
+        let mut original = match item.file.take() {
+            Some(file) => file,
+            None => {
+                let file = File::open(&context.path)?;
+                let metadata = file.metadata()?;
+                let saved = &context.orig_metadata;
+                if metadata.dev() != saved.dev()
+                    || metadata.ino() != saved.ino()
+                    || metadata.len() != saved.len()
+                    || metadata.modified()? != saved.modified()?
+                    || metadata.nlink() != saved.nlink()
+                {
+                    return Err(io::Error::other("source file changed after staging"));
+                }
+                Arc::new(file)
+            }
+        };
+        copy_xattrs(&original, tmp_file.as_file())?;
 
         // Copy the encoded resource fork explicitly. Copying a transparently
         // compressed file through its data fork would decompress it again.
-        let expected = item.payload.as_file().metadata()?.len();
-        item.payload.rewind()?;
+        let mut payload = File::open(&item.payload)?;
+        let expected = payload.metadata()?.len();
         let copied = match &item.contents {
             StagedContents::Compressed(_) => copy_payload(
-                item.payload.as_file_mut(),
+                &mut payload,
                 ResourceFork::new(tmp_file.as_file()),
                 &mut self.buffer,
+                item.batch_progress.as_deref(),
             )?,
             StagedContents::Uncompressed => {
                 if expected != context.orig_metadata.len() {
@@ -414,9 +471,10 @@ impl PublishHandler {
                     ));
                 }
                 copy_payload(
-                    item.payload.as_file_mut(),
+                    &mut payload,
                     tmp_file.as_file_mut(),
                     &mut self.buffer,
+                    item.batch_progress.as_deref(),
                 )?
             }
         };
@@ -427,11 +485,15 @@ impl PublishHandler {
         }
         context.progress.phase("Finalizing");
         match &item.contents {
-            StagedContents::Compressed(decmpfs_data) => {
-                finish_compressed_file(context, &mut item.file, tmp_file, decmpfs_data)
-            }
+            StagedContents::Compressed(decmpfs_data) => finish_compressed_file(
+                context,
+                &mut original,
+                tmp_file,
+                decmpfs_data,
+                item.batch_progress.as_deref(),
+            ),
             StagedContents::Uncompressed => {
-                finish_uncompressed_file(context, &mut item.file, tmp_file)
+                finish_uncompressed_file(context, &mut original, tmp_file)
             }
         }
     }
@@ -463,6 +525,7 @@ impl WorkHandler<StagedFile> for PublishHandler {
             payload,
             reservation,
             context,
+            finished,
             ..
         } = item;
         if let Err(error) = payload.close() {
@@ -471,6 +534,11 @@ impl WorkHandler<StagedFile> for PublishHandler {
                 .error(&format!("Error removing scratch payload: {error}"));
             reservation.stop();
         }
+        drop(reservation);
+        drop(context);
+        if let Some(finished) = finished {
+            let _ = finished.send(());
+        }
     }
 }
 
@@ -478,6 +546,7 @@ fn copy_payload(
     mut source: impl Read,
     mut destination: impl Write,
     buffer: &mut [u8],
+    progress: Option<&(dyn Task + Send + Sync)>,
 ) -> io::Result<u64> {
     let mut copied = 0;
     loop {
@@ -485,7 +554,26 @@ fn copy_payload(
         if size == 0 {
             break;
         }
-        destination.write_all(&buffer[..size])?;
+        // Report successful writes, including a partial chunk before an I/O error.
+        let mut remaining = &buffer[..size];
+        while !remaining.is_empty() {
+            match destination.write(remaining) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to copy scratch payload",
+                    ))
+                }
+                Ok(written) => {
+                    if let Some(progress) = progress {
+                        progress.increment(written as u64);
+                    }
+                    remaining = &remaining[written..];
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
         copied += size as u64;
     }
     destination.flush()?;
@@ -586,7 +674,7 @@ mod tests {
     use tempfile::TempDir;
 
     struct Progress;
-    impl crate::progress::Task for Progress {
+    impl Task for Progress {
         fn increment(&self, _amt: u64) {}
         fn error(&self, message: &str) {
             panic!("{message}");
@@ -654,6 +742,7 @@ mod tests {
                     file: Arc::new(File::open(input).unwrap()),
                     blocks,
                     reservation: Some(reservation),
+                    completion: None,
                 },
                 kind,
             )
@@ -673,7 +762,7 @@ mod tests {
         assert!(!info::get(&path).unwrap().is_compressed);
         assert_eq!(fs::read(&path).unwrap(), original);
         // Scratch is an ordinary file containing the encoded resource fork.
-        assert!(!info::get(staged.payload.path()).unwrap().is_compressed);
+        assert!(!info::get(&staged.payload).unwrap().is_compressed);
         let mut publisher = Publish.make_handler();
         publisher.publish(&mut staged).unwrap();
         assert_ne!(path.metadata().unwrap().ino(), inode);
@@ -701,6 +790,34 @@ mod tests {
     }
 
     #[test]
+    fn batch_publishing_rejects_changed_or_replaced_sources() {
+        for replace in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let path = input.path().join("file");
+            let (mut staged, mut original) = stage(&path, scratch.path());
+            staged.file = None;
+            if replace {
+                fs::remove_file(&path).unwrap();
+                fs::write(&path, &original).unwrap();
+            } else {
+                original.push(b'b');
+                fs::write(&path, &original).unwrap();
+            }
+            let inode = path.metadata().unwrap().ino();
+            let error = Publish.make_handler().publish(&mut staged).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("source file changed after staging"));
+            assert_eq!(path.metadata().unwrap().ino(), inode);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!info::get(&path).unwrap().is_compressed);
+            drop(staged);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
     fn payload_copy_uses_full_chunks_and_propagates_write_failures() {
         struct Writes(Vec<usize>);
         impl Write for Writes {
@@ -714,12 +831,65 @@ mod tests {
         }
         let mut destination = Writes(Vec::new());
         assert_eq!(
-            copy_payload(&[0; 19][..], &mut destination, &mut [0; 8]).unwrap(),
+            copy_payload(&[0; 19][..], &mut destination, &mut [0; 8], None).unwrap(),
             19
         );
         assert_eq!(destination.0, [8, 8, 3]);
         let mut too_small = [0; 2];
-        assert!(copy_payload(&[0; 19][..], &mut too_small[..], &mut [0; 8]).is_err());
+        assert!(copy_payload(&[0; 19][..], &mut too_small[..], &mut [0; 8], None).is_err());
+    }
+
+    #[test]
+    fn payload_progress_counts_partial_writes_and_retries_interruptions() {
+        struct Counter(std::sync::atomic::AtomicU64);
+        impl Task for Counter {
+            fn increment(&self, bytes: u64) {
+                self.0
+                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn error(&self, message: &str) {
+                panic!("{message}");
+            }
+        }
+        struct Destination {
+            capacity: usize,
+            interrupted: bool,
+        }
+        impl Write for Destination {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let written = bytes.len().min(3).min(self.capacity);
+                self.capacity -= written;
+                Ok(written)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for (capacity, expected) in [(19, 19), (5, 5)] {
+            let progress = Counter(std::sync::atomic::AtomicU64::new(0));
+            let result = copy_payload(
+                &[0; 19][..],
+                Destination {
+                    capacity,
+                    interrupted: false,
+                },
+                &mut [0; 8],
+                Some(&progress),
+            );
+            if capacity == 19 {
+                assert_eq!(result.unwrap(), 19);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
+            }
+            assert_eq!(
+                progress.0.load(std::sync::atomic::Ordering::Relaxed),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -731,7 +901,7 @@ mod tests {
             let (mut staged, original) = stage(&path, scratch.path());
             Publish.make_handler().publish(&mut staged).unwrap();
             let inode = path.metadata().unwrap().ino();
-            staged.file = Arc::new(File::open(&path).unwrap());
+            staged.file = Some(Arc::new(File::open(&path).unwrap()));
             let context = Arc::get_mut(&mut staged.context).unwrap();
             context.orig_metadata = path.metadata().unwrap();
             context.orig_compression_info =
@@ -744,11 +914,12 @@ mod tests {
                 .unwrap()
                 .reserve_uncompressed(original.len() as u64)
                 .unwrap();
-            staged.payload.as_file_mut().set_len(0).unwrap();
-            staged.payload.rewind().unwrap();
-            staged.payload.write_all(&original).unwrap();
-            staged.payload.rewind().unwrap();
-            staged.payload.write_all(b"b").unwrap();
+            fs::write(&staged.payload, &original).unwrap();
+            let mut payload = fs::OpenOptions::new()
+                .write(true)
+                .open(&staged.payload)
+                .unwrap();
+            payload.write_all(b"b").unwrap();
             staged.contents = StagedContents::Uncompressed;
             let error = Publish.make_handler().publish(&mut staged).unwrap_err();
             assert!(error.to_string().contains("verification failed"), "{error}");

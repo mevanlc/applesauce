@@ -224,6 +224,19 @@ struct ScratchOptions {
     /// Filesystem overhead and destination temporary files are excluded.
     #[arg(long, value_name = "SIZE", requires = "scratch", value_parser = parse_scratch_limit)]
     scratch_limit: Option<u64>,
+
+    /// Stage whole-file batches, then pause source reads while copying each batch back
+    ///
+    /// With no SIZE, use --scratch-limit (default: 16GiB) as the batch target.
+    /// An explicit size requires '=' and cannot exceed the scratch limit.
+    /// Files larger than the target get their own batch if they fit the limit.
+    /// Waits for a destination-volume flush before resuming source reads.
+    /// Verification and filesystem metadata operations may still read while copying.
+    #[arg(
+        long, value_name = "SIZE", requires = "scratch",
+        num_args = 0..=1, require_equals = true, value_parser = parse_scratch_limit
+    )]
+    scratch_batch: Option<Option<u64>>,
 }
 
 const DEFAULT_SCRATCH_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
@@ -231,17 +244,24 @@ const DEFAULT_SCRATCH_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 impl ScratchOptions {
     fn file_compressor(self) -> applesauce::FileCompressor {
         match self.scratch {
-            Some(directory) => applesauce::FileCompressor::with_scratch(
-                &directory,
-                self.scratch_limit.unwrap_or(DEFAULT_SCRATCH_LIMIT),
-            )
-            .unwrap_or_else(|error| {
-                eprintln!(
-                    "Unable to use scratch directory {}: {error}",
-                    directory.display()
-                );
-                std::process::exit(1);
-            }),
+            Some(directory) => {
+                let limit = self.scratch_limit.unwrap_or(DEFAULT_SCRATCH_LIMIT);
+                let result = match self.scratch_batch {
+                    Some(target) => applesauce::FileCompressor::with_scratch_batch(
+                        &directory,
+                        limit,
+                        target.unwrap_or(limit),
+                    ),
+                    None => applesauce::FileCompressor::with_scratch(&directory, limit),
+                };
+                result.unwrap_or_else(|error| {
+                    eprintln!(
+                        "Unable to configure scratch storage in {}: {error}",
+                        directory.display()
+                    );
+                    std::process::exit(1);
+                })
+            }
             None => applesauce::FileCompressor::new(),
         }
     }
@@ -971,6 +991,45 @@ fn decompress_scratch_arguments() {
             Some(512 * 1024 * 1024)
         );
         assert!(Cli::try_parse_from(["applesauce", command, "--scratch-limit=1GiB", "."]).is_err());
+    }
+}
+
+#[test]
+fn scratch_batch_arguments_preserve_paths_and_optional_sizes() {
+    for command in ["compress", "decompress", "uncompress"] {
+        for (flag, expected) in [
+            ("--scratch-batch", Some(None)),
+            ("--scratch-batch=4GiB", Some(Some(4 * 1024 * 1024 * 1024))),
+        ] {
+            let cli = Cli::try_parse_from([
+                "applesauce",
+                command,
+                "--scratch=/tmp",
+                flag,
+                "first",
+                "second",
+            ])
+            .unwrap();
+            let (scratch, paths) = match cli.command {
+                Commands::Compress(options) => (options.scratch_options, options.paths),
+                Commands::Decompress(options) => (options.scratch_options, options.paths),
+                Commands::Info(_) => unreachable!(),
+            };
+            assert_eq!(scratch.scratch_batch, expected);
+            assert_eq!(paths, [PathBuf::from("first"), PathBuf::from("second")]);
+        }
+        for flag in ["--scratch-batch", "--scratch-batch=4GiB"] {
+            assert!(Cli::try_parse_from(["applesauce", command, flag, "."]).is_err());
+        }
+        for flag in [
+            "--scratch-batch=0",
+            "--scratch-batch=",
+            "--scratch-batch=invalid",
+        ] {
+            assert!(
+                Cli::try_parse_from(["applesauce", command, "--scratch=/tmp", flag, "."]).is_err()
+            );
+        }
     }
 }
 

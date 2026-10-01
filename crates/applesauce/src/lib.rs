@@ -209,6 +209,30 @@ impl FileCompressor {
         })
     }
 
+    /// Stage whole-file batches, then pause source reads while publishing each batch.
+    ///
+    /// `target` is the batch reservation target and must be positive and no greater
+    /// than `limit`. A file requiring more than `target` gets its own batch if it
+    /// fits `limit`. The hard limit has the same meaning as in [`Self::with_scratch`].
+    /// Each batch waits for a flush of its affected destination volumes before reads resume.
+    /// Verification and filesystem metadata operations may still read while publishing.
+    pub fn with_scratch_batch(
+        directory: impl AsRef<Path>,
+        limit: u64,
+        target: u64,
+    ) -> io::Result<Self> {
+        if target == 0 || target > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scratch batch size must be greater than zero and no larger than the scratch limit",
+            ));
+        }
+        let scratch = std::sync::Arc::new(scratch::Scratch::new(directory.as_ref(), limit)?);
+        Ok(Self {
+            bg_threads: BackgroundThreads::with_scratch_batch(Some(scratch), Some(target)),
+        })
+    }
+
     #[tracing::instrument(skip_all)]
     pub fn recursive_compress<'a, P>(
         &mut self,
@@ -789,7 +813,437 @@ mod tests {
         let input = TempDir::new().unwrap();
         assert!(FileCompressor::with_scratch(input.path().join("missing"), 1024).is_err());
         assert!(FileCompressor::with_scratch(input.path(), 0).is_err());
+        assert!(FileCompressor::with_scratch_batch(input.path(), 1024, 0).is_err());
+        assert!(FileCompressor::with_scratch_batch(input.path(), 1024, 1025).is_err());
         assert_eq!(fs::read_dir(input.path()).unwrap().count(), 0);
+    }
+
+    #[derive(Clone, Default)]
+    struct BatchProgress {
+        phases: std::sync::Arc<Mutex<Vec<(PathBuf, &'static str)>>>,
+        errors: std::sync::Arc<Mutex<Vec<String>>>,
+        batches: std::sync::Arc<Mutex<Vec<std::sync::Arc<BatchBytes>>>>,
+    }
+
+    struct BatchBytes {
+        total: u64,
+        copied: AtomicU64,
+        flushing: std::sync::atomic::AtomicBool,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    struct BatchBytesTask {
+        bytes: std::sync::Arc<BatchBytes>,
+        progress: BatchProgress,
+    }
+
+    impl Task for BatchBytesTask {
+        fn increment(&self, bytes: u64) {
+            self.bytes
+                .copied
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn error(&self, message: &str) {
+            panic!("{message}");
+        }
+        fn phase(&self, phase: &'static str) {
+            if phase == "Flushing volume" {
+                self.bytes
+                    .flushing
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.progress
+                    .phases
+                    .lock()
+                    .unwrap()
+                    .push((PathBuf::new(), "Flushing scratch batch"));
+            }
+        }
+    }
+
+    impl Drop for BatchBytesTask {
+        fn drop(&mut self) {
+            self.bytes
+                .finished
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct BatchTask {
+        path: PathBuf,
+        progress: BatchProgress,
+    }
+
+    impl Drop for BatchTask {
+        fn drop(&mut self) {
+            self.progress
+                .phases
+                .lock()
+                .unwrap()
+                .push((self.path.clone(), "Finished"));
+        }
+    }
+
+    impl Task for BatchTask {
+        fn increment(&self, _amt: u64) {}
+        fn error(&self, message: &str) {
+            self.progress
+                .errors
+                .lock()
+                .unwrap()
+                .push(message.to_owned());
+        }
+        fn phase(&self, phase: &'static str) {
+            self.progress
+                .phases
+                .lock()
+                .unwrap()
+                .push((self.path.clone(), phase));
+        }
+    }
+
+    impl Progress for BatchProgress {
+        type Task = BatchTask;
+        fn error(&self, path: &Path, message: &str) {
+            self.errors
+                .lock()
+                .unwrap()
+                .push(format!("{}: {message}", path.display()));
+        }
+        fn file_task(&self, path: &Path, _size: u64) -> Self::Task {
+            BatchTask {
+                path: path.to_owned(),
+                progress: self.clone(),
+            }
+        }
+        fn scratch_batch_task(&self, size: u64) -> Option<Box<dyn Task + Send + Sync>> {
+            let batch = std::sync::Arc::new(BatchBytes {
+                total: size,
+                copied: AtomicU64::new(0),
+                flushing: std::sync::atomic::AtomicBool::new(false),
+                finished: std::sync::atomic::AtomicBool::new(false),
+            });
+            self.batches
+                .lock()
+                .unwrap()
+                .push(std::sync::Arc::clone(&batch));
+            Some(Box::new(BatchBytesTask {
+                bytes: batch,
+                progress: self.clone(),
+            }))
+        }
+    }
+
+    fn assert_batch_phases(progress: &BatchProgress, oversized: &Path, count: usize) {
+        use std::collections::HashSet;
+        let phases = progress.phases.lock().unwrap();
+        let mut reading = HashSet::new();
+        let mut staged = HashSet::new();
+        let mut copying = HashSet::new();
+        let mut finished = HashSet::new();
+        let mut batches = 0;
+        for (path, phase) in &*phases {
+            match *phase {
+                "Compressing to scratch" | "Decompressing to scratch" => {
+                    assert!(
+                        copying.is_empty(),
+                        "admitted reads before batch flush: {phases:?}"
+                    );
+                    reading.insert(path);
+                }
+                "Waiting to copy" => {
+                    staged.insert(path);
+                }
+                "Copying from scratch" => {
+                    assert_eq!(
+                        reading, staged,
+                        "started publishing before staging completed"
+                    );
+                    copying.insert(path);
+                }
+                "Finished" => {
+                    finished.insert(path);
+                }
+                "Flushing scratch batch" => {
+                    assert_eq!(reading, copying, "flushed before copying the whole batch");
+                    assert_eq!(
+                        copying, finished,
+                        "completed file progress kept alive during volume flush"
+                    );
+                    if reading.contains(&oversized.to_path_buf()) {
+                        assert_eq!(reading.len(), 1, "oversized file shared a batch");
+                    }
+                    reading.clear();
+                    staged.clear();
+                    copying.clear();
+                    finished.clear();
+                    batches += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(reading.is_empty(), "final partial batch was not published");
+        assert!(batches >= 2);
+        let bytes = progress.batches.lock().unwrap();
+        assert_eq!(bytes.len(), batches);
+        for batch in &*bytes {
+            assert_eq!(
+                batch.copied.load(std::sync::atomic::Ordering::Relaxed),
+                batch.total
+            );
+            assert!(batch.flushing.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(batch.finished.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        assert_eq!(
+            phases
+                .iter()
+                .filter(|(_, phase)| *phase == "Copying from scratch")
+                .count(),
+            count
+        );
+    }
+
+    #[test]
+    fn scratch_batches_round_trip_formats_and_separate_read_write_phases() {
+        for kind in [Kind::Zlib, Kind::Lzvn, Kind::Lzfse]
+            .into_iter()
+            .filter(|k| k.supported())
+        {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            // More files than the writer and publisher queues can hold, plus an
+            // oversized-but-allowed file and a final small partial batch.
+            let mut paths = Vec::new();
+            for n in 0..64 {
+                let path = input.path().join(format!("small-{n:02}"));
+                fs::write(&path, vec![n as u8; 16 * 1024]).unwrap();
+                paths.push(path);
+            }
+            let oversized = input.path().join("oversized");
+            fs::write(&oversized, vec![b'b'; 384 * 1024]).unwrap();
+            paths.push(oversized.clone());
+            let inline = input.path().join("inline");
+            fs::write(&inline, [b'x'; 256]).unwrap();
+            paths.push(inline);
+            let file = File::open(&paths[0]).unwrap();
+            xattr::set(&file, c"user.applesauce-test", b"preserved", 0).unwrap();
+            drop(file);
+            let before = recursive_read(input.path());
+            let mut compressor =
+                FileCompressor::with_scratch_batch(scratch.path(), 512 * 1024, 256 * 1024).unwrap();
+            let progress = BatchProgress::default();
+            let stats = compressor.recursive_compress(
+                paths.iter().map(PathBuf::as_path),
+                kind,
+                0.95,
+                5,
+                &progress,
+                true,
+            );
+            assert!(
+                progress.errors.lock().unwrap().is_empty(),
+                "{:?}",
+                progress.errors.lock().unwrap()
+            );
+            assert_eq!(
+                stats
+                    .compressed_file_count_final
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                paths.len() as u64
+            );
+            assert_batch_phases(&progress, &oversized, paths.len());
+            let encoded_bytes: u64 = paths
+                .iter()
+                .map(|path| {
+                    let file = File::open(path).unwrap();
+                    xattr::read(&file, applesauce_core::decmpfs::XATTR_NAME)
+                        .unwrap()
+                        .unwrap()
+                        .len() as u64
+                        + resource_fork::ResourceFork::new(&file)
+                            .seek(io::SeekFrom::End(0))
+                            .unwrap()
+                })
+                .sum();
+            assert_eq!(
+                progress
+                    .batches
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|batch| batch.total)
+                    .sum::<u64>(),
+                encoded_bytes
+            );
+            assert_entries_equal(&before, &recursive_read(input.path()));
+            for manual in [false, true] {
+                if manual {
+                    compressor.recursive_compress(
+                        paths.iter().map(PathBuf::as_path),
+                        kind,
+                        0.95,
+                        5,
+                        &NoProgress,
+                        true,
+                    );
+                }
+                let progress = BatchProgress::default();
+                let stats = compressor.recursive_decompress(
+                    paths.iter().map(PathBuf::as_path),
+                    manual,
+                    &progress,
+                    true,
+                );
+                assert!(
+                    progress.errors.lock().unwrap().is_empty(),
+                    "{:?}",
+                    progress.errors.lock().unwrap()
+                );
+                assert_eq!(
+                    stats
+                        .compressed_file_count_final
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0
+                );
+                assert_batch_phases(&progress, &oversized, paths.len());
+                assert_eq!(
+                    progress
+                        .batches
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|batch| batch.total)
+                        .sum::<u64>(),
+                    paths
+                        .iter()
+                        .map(|path| path.metadata().unwrap().len())
+                        .sum::<u64>()
+                );
+                assert_entries_equal(&before, &recursive_read(input.path()));
+            }
+            assert_eq!(
+                xattr::read(&File::open(&paths[0]).unwrap(), c"user.applesauce-test")
+                    .unwrap()
+                    .unwrap(),
+                b"preserved"
+            );
+            drop(compressor);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn scratch_batch_failures_and_hard_limits_leave_originals_intact() {
+        let input = TempDir::new().unwrap();
+        let scratch = TempDir::new().unwrap();
+        let large = input.path().join("large");
+        let small = input.path().join("small");
+        fs::write(&large, vec![7; 3 * 1024 * 1024]).unwrap();
+        fs::write(&small, vec![b'a'; 64 * 1024]).unwrap();
+        let before = recursive_read(input.path());
+        let progress = ScratchProgress::default();
+        // Failure on the first encoded block must wait for readers to stop,
+        // release reservations, and finish even when no staged files succeeded.
+        let mut compressor =
+            FileCompressor::with_scratch_batch(scratch.path(), 4 * 1024 * 1024, 4 * 1024 * 1024)
+                .unwrap();
+        compressor.recursive_compress([input.path()], Kind::default(), 0.0, 5, &progress, true);
+        assert!(!progress.errors.lock().unwrap().is_empty());
+        assert_entries_equal(&before, &recursive_read(input.path()));
+        drop(compressor);
+        let progress = ScratchProgress::default();
+        let mut compressor =
+            FileCompressor::with_scratch_batch(scratch.path(), 128 * 1024, 32 * 1024).unwrap();
+        compressor.recursive_compress([input.path()], Kind::default(), 0.95, 5, &progress, true);
+        let errors = progress.errors.lock().unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("scratch limit"));
+        assert!(!info::get(&large).unwrap().is_compressed);
+        assert!(info::get(&small).unwrap().is_compressed);
+        assert_entries_equal(&before, &recursive_read(input.path()));
+        drop(compressor);
+        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    struct FaultTask {
+        path: PathBuf,
+        progress: ScratchProgress,
+    }
+
+    impl Task for FaultTask {
+        fn increment(&self, _amt: u64) {}
+        fn error(&self, message: &str) {
+            Task::error(&self.progress, message);
+        }
+        fn phase(&self, phase: &'static str) {
+            match (self.path.file_name().unwrap().to_str().unwrap(), phase) {
+                ("reader-failure", "Compressing to scratch") => {
+                    fs::remove_file(&self.path).unwrap()
+                }
+                ("publisher-failure", "Copying from scratch") => {
+                    fs::write(&self.path, b"changed after staging").unwrap()
+                }
+                _ => {}
+            }
+        }
+    }
+
+    struct FaultProgress(ScratchProgress);
+
+    impl Progress for FaultProgress {
+        type Task = FaultTask;
+        fn error(&self, path: &Path, message: &str) {
+            Progress::error(&self.0, path, message);
+        }
+        fn file_task(&self, path: &Path, _size: u64) -> Self::Task {
+            FaultTask {
+                path: path.to_owned(),
+                progress: self.0.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_batch_reader_and_publisher_errors_allow_later_batches() {
+        let input = TempDir::new().unwrap();
+        let scratch = TempDir::new().unwrap();
+        let paths: Vec<_> = ["reader-failure", "publisher-failure", "success"]
+            .into_iter()
+            .map(|name| input.path().join(name))
+            .collect();
+        for path in &paths {
+            fs::write(path, vec![b'a'; 128 * 1024]).unwrap();
+        }
+        let progress = FaultProgress(ScratchProgress::default());
+        // Every file is larger than the batch target and gets its own batch.
+        let mut compressor =
+            FileCompressor::with_scratch_batch(scratch.path(), 256 * 1024, 64 * 1024).unwrap();
+        let stats = compressor.recursive_compress(
+            paths.iter().map(PathBuf::as_path),
+            Kind::default(),
+            0.95,
+            5,
+            &progress,
+            true,
+        );
+        let errors = progress.0.errors.lock().unwrap();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("Error opening")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("source file changed after staging")));
+        assert!(!paths[0].exists());
+        assert_eq!(fs::read(&paths[1]).unwrap(), b"changed after staging");
+        assert!(!info::get(&paths[1]).unwrap().is_compressed);
+        assert!(info::get(&paths[2]).unwrap().is_compressed);
+        assert_eq!(fs::read(&paths[2]).unwrap(), vec![b'a'; 128 * 1024]);
+        assert_eq!(
+            stats
+                .compressed_file_count_final
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(compressor);
+        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
     }
 
     #[test]

@@ -77,8 +77,11 @@ before copying completed files to a slower destination:
 cd /Volumes/SLOWER
 applesauce compress --scratch="$TMPDIR" .
 applesauce compress --scratch="$TMPDIR" --scratch-limit=32GiB --verify .
+applesauce compress --scratch="$TMPDIR" --scratch-batch .
+applesauce compress --scratch="$TMPDIR" --scratch-batch=4GiB --verify .
 applesauce decompress --scratch="$TMPDIR" .
 applesauce decompress --scratch="$TMPDIR" --scratch-limit=32GiB --manual --verify .
+applesauce decompress --scratch="$TMPDIR" --scratch-batch=4GiB .
 ```
 
 Compression workers stage encoded payloads; decompression workers stage ordinary
@@ -104,9 +107,37 @@ released after copying and deleting the scratch payload. A file whose full
 reservation exceeds the limit is left unchanged with an error; increase the
 limit to process it.
 
-Scratch storage is removed on normal completion. Reads from the destination
-can still overlap with the copy worker's writes. Filesystem allocation and
-writeback determine physical disk access, so performance gains depend on the
+`--scratch-batch[=SIZE]` alternates staging and publishing whole-file batches.
+Applesauce stops admitting source reads when the next file's reservation would
+exceed the batch target, waits for all admitted files to finish staging, then
+copies the completed batch back, removes its scratch payloads, and waits for a
+flush of each affected destination volume before resuming source reads.
+The flush covers the volume, including other applications' pending writes.
+The final partial batch is also published. This works with both
+compression and decompression, including `--manual`.
+
+During publishing, an additional darker-green **Batch flush** progress bar shows
+destination bytes copied versus the current batch's actual staged output size.
+It counts encoded payloads and compression metadata for compression, or expanded
+data for decompression. It is separate from the overall green bar and the white
+per-file bars, which clear as their files finish publishing. After copying, it
+displays **Flushing volume** until the volume
+flush finishes, then clears and resets for the next batch. Byte progress measures
+copies accepted by the filesystem; the volume flush provides the final disk wait.
+
+Without a size, `--scratch-batch` uses the scratch limit as its target. An explicit
+size requires `=`, as in `--scratch-batch=4GiB`, and must be positive and no greater
+than the scratch limit. The target counts completed output and worst-case
+reservations for files still being processed. A file whose reservation exceeds
+the target gets its own batch if it fits the hard scratch limit. Staged files
+have their handles closed until publishing, so large batches of small files do
+not keep an open handle for every source and payload.
+
+Scratch storage is removed on normal completion. Without `--scratch-batch`,
+reads from the destination can still overlap with the copy worker's writes.
+Batching separates bulk source reads from publishing, but verification and
+filesystem metadata operations can still read during publishing. Filesystem
+allocation and writeback determine physical disk access, so performance gains depend on the
 device and workload. Without `--scratch`, Applesauce uses its existing streaming
 pipeline.
 

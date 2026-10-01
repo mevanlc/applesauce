@@ -65,7 +65,7 @@ impl<'a, P: Progress + Send + Sync> Walker<'a, P> {
     pub fn run(
         self,
         context: &Arc<OperationContext>,
-        f: impl Fn(FileType, PathBuf, Option<Arc<times::Resetter>>) + Send + Sync,
+        mut f: impl FnMut(FileType, PathBuf, Option<Arc<times::Resetter>>) + Send + Sync,
     ) {
         for path in self.paths {
             let walker = walk_dir_over(path, Arc::clone(context));

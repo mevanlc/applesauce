@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::{fmt, mem};
 use tracing::warn;
 
+mod batching;
 pub mod compressing;
 pub mod reader;
 pub mod writer;
@@ -40,8 +41,9 @@ pub struct BackgroundThreads {
     reader: BgWorker<reader::Work>,
     _compressor: BgWorker<compressing::Work>,
     _writer: BgWorker<writer::Work>,
-    _publisher: Option<BgWorker<writer::Publish>>,
+    publisher: Option<BgWorker<writer::Publish>>,
     scratch: Option<Arc<Scratch>>,
+    batch_target: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -155,6 +157,13 @@ impl BackgroundThreads {
     }
 
     pub(crate) fn with_scratch(scratch: Option<Arc<Scratch>>) -> Self {
+        Self::with_scratch_batch(scratch, None)
+    }
+
+    pub(crate) fn with_scratch_batch(
+        scratch: Option<Arc<Scratch>>,
+        batch_target: Option<u64>,
+    ) -> Self {
         let compressor_threads = thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1);
@@ -178,8 +187,9 @@ impl BackgroundThreads {
             reader,
             _compressor: compressor,
             _writer: writer,
-            _publisher: publisher,
+            publisher,
             scratch,
+            batch_target,
         }
     }
 
@@ -218,6 +228,14 @@ impl BackgroundThreads {
         ));
         let stats = &operation.stats;
         let chan = self.reader.chan();
+        let mut batch = self.batch_target.map(|target| {
+            batching::Batch::new(
+                target,
+                Arc::clone(self.scratch.as_ref().unwrap()),
+                self.publisher.as_ref().unwrap().chan().clone(),
+                progress,
+            )
+        });
 
         walker.run(&operation, |file_type, path, dir_reset| {
             // We really only want to deal with files, not symlinks to files, or fifos, etc.
@@ -284,20 +302,30 @@ impl BackgroundThreads {
             };
 
             let inner_progress = Box::new(progress.file_task(&path, metadata.len()));
-            chan.send(reader::WorkItem {
-                context: Arc::new(Context {
-                    operation: Arc::clone(&operation),
-                    path,
-                    progress: inner_progress,
-                    orig_metadata: metadata,
-                    parent_resetter: dir_reset,
-                    orig_times: saved_times,
-                    orig_compression_info: file_info,
-                    stats_reported: AtomicBool::new(false),
-                }),
-            })
-            .unwrap();
+            let context = Arc::new(Context {
+                operation: Arc::clone(&operation),
+                path,
+                progress: inner_progress,
+                orig_metadata: metadata,
+                parent_resetter: dir_reset,
+                orig_times: saved_times,
+                orig_compression_info: file_info,
+                stats_reported: AtomicBool::new(false),
+            });
+            if let Some(batch) = &mut batch {
+                batch.submit(context, chan);
+            } else {
+                chan.send(reader::WorkItem {
+                    context,
+                    reservation: None,
+                    completion: None,
+                })
+                .unwrap();
+            }
         });
+        if let Some(batch) = &mut batch {
+            batch.drain();
+        }
         drop(operation);
 
         finished_stats_rx

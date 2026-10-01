@@ -28,6 +28,7 @@ pub enum Verbosity {
 pub struct ProgressBars {
     style: ProgressStyle,
     total_bar: ProgressBar,
+    batch_bar: Mutex<Option<ProgressBar>>,
     bars: MultiProgress,
     verbosity: Verbosity,
 }
@@ -35,6 +36,9 @@ pub struct ProgressBars {
 impl ProgressBars {
     pub fn finish(&self) {
         self.total_bar.finish_and_clear();
+        if let Some(bar) = &*self.batch_bar.lock().unwrap() {
+            bar.finish_and_clear();
+        }
         let _ = self.bars.clear();
     }
 }
@@ -98,6 +102,7 @@ impl ProgressBars {
         Self {
             style,
             total_bar,
+            batch_bar: Mutex::new(None),
             bars,
             verbosity,
         }
@@ -206,6 +211,52 @@ impl Progress for ProgressBars {
             }),
             verbosity: self.verbosity,
         }
+    }
+
+    fn scratch_batch_task(&self, size: u64) -> Option<Box<dyn Task + Send + Sync>> {
+        // Keep the final staging count visible while source progress pauses.
+        self.total_bar.enable_steady_tick(DELAY);
+        let mut batch_bar = self.batch_bar.lock().unwrap();
+        let bar = batch_bar.get_or_insert_with(|| {
+            // ANSI 256-color green 28 is darker than the overall green bar.
+            let style = ProgressStyle::with_template(
+                "{prefix:>25.bold} {wide_bar:.28} {bytes:>11}/{total_bytes:<11} {msg}",
+            )
+            .unwrap();
+            self.bars
+                .add(ProgressBar::new(0))
+                .with_style(style)
+                .with_prefix("Batch flush:")
+        });
+        bar.reset();
+        bar.set_length(size);
+        bar.set_message("Copying");
+        bar.enable_steady_tick(DELAY);
+        Some(Box::new(ScratchBatchProgress { bar: bar.clone() }))
+    }
+}
+
+struct ScratchBatchProgress {
+    bar: ProgressBar,
+}
+
+impl Task for ScratchBatchProgress {
+    fn increment(&self, amt: u64) {
+        self.bar.inc(amt);
+    }
+
+    fn phase(&self, message: &'static str) {
+        self.bar.set_message(message);
+    }
+
+    fn error(&self, message: &str) {
+        self.bar.println(message);
+    }
+}
+
+impl Drop for ScratchBatchProgress {
+    fn drop(&mut self) {
+        self.bar.finish_and_clear();
     }
 }
 
@@ -331,5 +382,31 @@ mod tests {
 
         progress.finish();
         assert!(!term.line_visible());
+    }
+
+    #[test]
+    fn batch_bar_tracks_output_separately_and_resets_between_batches() {
+        let progress = ProgressBars::new(Verbosity::Normal);
+        let file = progress.file_task(Path::new("file"), 8192);
+        file.increment(8192);
+        let batch = progress.scratch_batch_task(1024).unwrap();
+        batch.increment(512);
+        let bar = progress.batch_bar.lock().unwrap().as_ref().unwrap().clone();
+        assert_eq!(bar.length(), Some(1024));
+        assert_eq!(bar.position(), 512);
+        assert_eq!(progress.total_bar.position(), 8192);
+        batch.phase("Flushing volume");
+        assert_eq!(bar.message(), "Flushing volume");
+        assert!(!bar.is_finished());
+        drop(batch);
+        assert!(bar.is_finished());
+        let next = progress.scratch_batch_task(256).unwrap();
+        assert_eq!(bar.position(), 0);
+        assert_eq!(bar.length(), Some(256));
+        assert_eq!(bar.message(), "Copying");
+        assert!(!bar.is_finished());
+        next.increment(256);
+        progress.finish();
+        assert!(bar.is_finished());
     }
 }

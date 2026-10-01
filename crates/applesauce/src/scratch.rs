@@ -47,15 +47,34 @@ impl Scratch {
     }
 
     pub(crate) fn reserve(&self, kind: Kind, file_size: u64) -> io::Result<Reservation> {
+        self.reserve_bytes(Self::compressed_reservation_size(kind, file_size))
+    }
+
+    pub(crate) fn compressed_reservation_size(kind: Kind, file_size: u64) -> u64 {
         let blocks = num_blocks(file_size);
         // Reserve every output block at the compressor's full buffer capacity, plus
         // the format header/trailer and inline xattr. This covers incompressible data
         // and avoids filling the budget with partial files that cannot finish.
-        let bytes = blocks * COMPRESSED_BLOCK_CAPACITY as u64
+        blocks * COMPRESSED_BLOCK_CAPACITY as u64
             + kind.header_size(blocks)
             + decmpfs::ZLIB_TRAILER.len() as u64
-            + decmpfs::MAX_XATTR_SIZE as u64;
+            + decmpfs::MAX_XATTR_SIZE as u64
+    }
+
+    pub(crate) fn reserve_bytes(&self, bytes: u64) -> io::Result<Reservation> {
         self.budget.reserve(bytes)
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self.budget.used.lock().unwrap().bytes
+    }
+
+    pub(crate) fn limit(&self) -> u64 {
+        self.budget.limit
+    }
+
+    pub(crate) fn stop(&self) {
+        self.budget.stop();
     }
 
     pub(crate) fn tempfile(&self) -> io::Result<NamedTempFile> {
@@ -65,7 +84,7 @@ impl Scratch {
     }
 
     pub(crate) fn reserve_uncompressed(&self, file_size: u64) -> io::Result<Reservation> {
-        self.budget.reserve(file_size)
+        self.reserve_bytes(file_size)
     }
 }
 
@@ -83,6 +102,12 @@ struct Usage {
 }
 
 impl Budget {
+    fn stop(&self) {
+        let mut used = self.used.lock().unwrap();
+        used.stopped = true;
+        self.available.notify_all();
+    }
+
     fn reserve(self: &Arc<Self>, bytes: u64) -> io::Result<Reservation> {
         if bytes > self.limit {
             return Err(io::Error::new(
@@ -99,7 +124,7 @@ impl Budget {
         }
         if used.stopped {
             return Err(io::Error::other(
-                "scratch staging stopped after a cleanup failure",
+                "scratch staging stopped after an I/O failure",
             ));
         }
         used.bytes += bytes;
@@ -122,6 +147,10 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
+    pub(crate) fn size(&self) -> u64 {
+        self.bytes
+    }
+
     pub(crate) fn shrink_to(&mut self, bytes: u64) {
         assert!(
             bytes <= self.bytes,
@@ -134,8 +163,7 @@ impl Reservation {
     }
 
     pub(crate) fn stop(&self) {
-        self.budget.used.lock().unwrap().stopped = true;
-        self.budget.available.notify_all();
+        self.budget.stop();
     }
 }
 
