@@ -203,10 +203,19 @@ impl FileCompressor {
     /// overhead and destination temporary files are not included in this limit.
     /// Decompression reserves each file's full uncompressed size.
     pub fn with_scratch(directory: impl AsRef<Path>, limit: u64) -> io::Result<Self> {
-        let scratch = std::sync::Arc::new(scratch::Scratch::new(directory.as_ref(), limit)?);
-        Ok(Self {
-            bg_threads: BackgroundThreads::with_scratch(Some(scratch)),
-        })
+        Self::from_scratch(scratch::Scratch::new(directory.as_ref(), limit)?, None)
+    }
+
+    /// Stage compression or decompression output in process memory, then copy it
+    /// to destination-volume temporary files, one file at a time.
+    ///
+    /// Uses the same worst-case reservations as [`Self::with_scratch`]. Completed
+    /// compression reservations cover buffer capacity and compression metadata.
+    /// `limit` excludes worker buffers, allocator overhead, temporary allocations
+    /// during buffer growth, and destination files. Buffers allocate lazily and
+    /// are freed after publishing; payloads are never spilled to scratch files.
+    pub fn with_memory_scratch(limit: u64) -> io::Result<Self> {
+        Self::from_scratch(scratch::Scratch::memory(limit)?, None)
     }
 
     /// Stage whole-file batches, then pause source reads while publishing each batch.
@@ -221,15 +230,33 @@ impl FileCompressor {
         limit: u64,
         target: u64,
     ) -> io::Result<Self> {
-        if target == 0 || target > limit {
+        Self::from_scratch(
+            scratch::Scratch::new(directory.as_ref(), limit)?,
+            Some(target),
+        )
+    }
+
+    /// Stage whole-file batches in memory, then publish and flush each batch
+    /// before resuming source reads.
+    ///
+    /// Batch behavior matches [`Self::with_scratch_batch`]; the memory limit has
+    /// the same meaning as in [`Self::with_memory_scratch`].
+    pub fn with_memory_scratch_batch(limit: u64, target: u64) -> io::Result<Self> {
+        Self::from_scratch(scratch::Scratch::memory(limit)?, Some(target))
+    }
+
+    fn from_scratch(scratch: scratch::Scratch, target: Option<u64>) -> io::Result<Self> {
+        if target.is_some_and(|target| target == 0 || target > scratch.limit()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "scratch batch size must be greater than zero and no larger than the scratch limit",
             ));
         }
-        let scratch = std::sync::Arc::new(scratch::Scratch::new(directory.as_ref(), limit)?);
         Ok(Self {
-            bg_threads: BackgroundThreads::with_scratch_batch(Some(scratch), Some(target)),
+            bg_threads: BackgroundThreads::with_scratch_batch(
+                Some(std::sync::Arc::new(scratch)),
+                target,
+            ),
         })
     }
 
@@ -604,11 +631,27 @@ mod tests {
         }
     }
 
+    fn scratch_compressor(
+        directory: &Path,
+        memory: bool,
+        limit: u64,
+        target: Option<u64>,
+    ) -> FileCompressor {
+        match (memory, target) {
+            (false, None) => FileCompressor::with_scratch(directory, limit),
+            (false, Some(target)) => FileCompressor::with_scratch_batch(directory, limit, target),
+            (true, None) => FileCompressor::with_memory_scratch(limit),
+            (true, Some(target)) => FileCompressor::with_memory_scratch_batch(limit, target),
+        }
+        .unwrap()
+    }
+
     #[test]
     fn scratch_round_trips_all_formats_with_bounded_backlog() {
-        for kind in [Kind::Zlib, Kind::Lzvn, Kind::Lzfse]
+        for (kind, memory) in [Kind::Zlib, Kind::Lzvn, Kind::Lzfse]
             .into_iter()
             .filter(|k| k.supported())
+            .flat_map(|kind| [false, true].map(|memory| (kind, memory)))
         {
             let input = TempDir::new().unwrap();
             let scratch = TempDir::new().unwrap();
@@ -631,8 +674,7 @@ mod tests {
             let before = recursive_read(input.path());
             let progress = ScratchProgress::default();
             // Only one worst-case large-file reservation fits at a time.
-            let mut compressor =
-                FileCompressor::with_scratch(scratch.path(), 6 * 1024 * 1024).unwrap();
+            let mut compressor = scratch_compressor(scratch.path(), memory, 6 * 1024 * 1024, None);
             let stats =
                 compressor.recursive_compress([input.path()], kind, 1.1, 5, &progress, true);
             assert!(
@@ -815,6 +857,9 @@ mod tests {
         assert!(FileCompressor::with_scratch(input.path(), 0).is_err());
         assert!(FileCompressor::with_scratch_batch(input.path(), 1024, 0).is_err());
         assert!(FileCompressor::with_scratch_batch(input.path(), 1024, 1025).is_err());
+        assert!(FileCompressor::with_memory_scratch(0).is_err());
+        assert!(FileCompressor::with_memory_scratch_batch(1024, 0).is_err());
+        assert!(FileCompressor::with_memory_scratch_batch(1024, 1025).is_err());
         assert_eq!(fs::read_dir(input.path()).unwrap().count(), 0);
     }
 
@@ -1004,9 +1049,10 @@ mod tests {
 
     #[test]
     fn scratch_batches_round_trip_formats_and_separate_read_write_phases() {
-        for kind in [Kind::Zlib, Kind::Lzvn, Kind::Lzfse]
+        for (kind, memory) in [Kind::Zlib, Kind::Lzvn, Kind::Lzfse]
             .into_iter()
             .filter(|k| k.supported())
+            .flat_map(|kind| [false, true].map(|memory| (kind, memory)))
         {
             let input = TempDir::new().unwrap();
             let scratch = TempDir::new().unwrap();
@@ -1029,7 +1075,7 @@ mod tests {
             drop(file);
             let before = recursive_read(input.path());
             let mut compressor =
-                FileCompressor::with_scratch_batch(scratch.path(), 512 * 1024, 256 * 1024).unwrap();
+                scratch_compressor(scratch.path(), memory, 512 * 1024, Some(256 * 1024));
             let progress = BatchProgress::default();
             let stats = compressor.recursive_compress(
                 paths.iter().map(PathBuf::as_path),
@@ -1133,35 +1179,47 @@ mod tests {
 
     #[test]
     fn scratch_batch_failures_and_hard_limits_leave_originals_intact() {
-        let input = TempDir::new().unwrap();
-        let scratch = TempDir::new().unwrap();
-        let large = input.path().join("large");
-        let small = input.path().join("small");
-        fs::write(&large, vec![7; 3 * 1024 * 1024]).unwrap();
-        fs::write(&small, vec![b'a'; 64 * 1024]).unwrap();
-        let before = recursive_read(input.path());
-        let progress = ScratchProgress::default();
-        // Failure on the first encoded block must wait for readers to stop,
-        // release reservations, and finish even when no staged files succeeded.
-        let mut compressor =
-            FileCompressor::with_scratch_batch(scratch.path(), 4 * 1024 * 1024, 4 * 1024 * 1024)
-                .unwrap();
-        compressor.recursive_compress([input.path()], Kind::default(), 0.0, 5, &progress, true);
-        assert!(!progress.errors.lock().unwrap().is_empty());
-        assert_entries_equal(&before, &recursive_read(input.path()));
-        drop(compressor);
-        let progress = ScratchProgress::default();
-        let mut compressor =
-            FileCompressor::with_scratch_batch(scratch.path(), 128 * 1024, 32 * 1024).unwrap();
-        compressor.recursive_compress([input.path()], Kind::default(), 0.95, 5, &progress, true);
-        let errors = progress.errors.lock().unwrap();
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("scratch limit"));
-        assert!(!info::get(&large).unwrap().is_compressed);
-        assert!(info::get(&small).unwrap().is_compressed);
-        assert_entries_equal(&before, &recursive_read(input.path()));
-        drop(compressor);
-        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let large = input.path().join("large");
+            let small = input.path().join("small");
+            fs::write(&large, vec![7; 3 * 1024 * 1024]).unwrap();
+            fs::write(&small, vec![b'a'; 64 * 1024]).unwrap();
+            let before = recursive_read(input.path());
+            let progress = ScratchProgress::default();
+            // Failure on the first encoded block must wait for readers to stop,
+            // release reservations, and finish even when no staged files succeeded.
+            let mut compressor = scratch_compressor(
+                scratch.path(),
+                memory,
+                4 * 1024 * 1024,
+                Some(4 * 1024 * 1024),
+            );
+            compressor.recursive_compress([input.path()], Kind::default(), 0.0, 5, &progress, true);
+            assert!(!progress.errors.lock().unwrap().is_empty());
+            assert_entries_equal(&before, &recursive_read(input.path()));
+            drop(compressor);
+            let progress = ScratchProgress::default();
+            let mut compressor =
+                scratch_compressor(scratch.path(), memory, 128 * 1024, Some(32 * 1024));
+            compressor.recursive_compress(
+                [input.path()],
+                Kind::default(),
+                0.95,
+                5,
+                &progress,
+                true,
+            );
+            let errors = progress.errors.lock().unwrap();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].contains("scratch limit"));
+            assert!(!info::get(&large).unwrap().is_compressed);
+            assert!(info::get(&small).unwrap().is_compressed);
+            assert_entries_equal(&before, &recursive_read(input.path()));
+            drop(compressor);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
     }
 
     struct FaultTask {
@@ -1204,51 +1262,56 @@ mod tests {
 
     #[test]
     fn scratch_batch_reader_and_publisher_errors_allow_later_batches() {
-        let input = TempDir::new().unwrap();
-        let scratch = TempDir::new().unwrap();
-        let paths: Vec<_> = ["reader-failure", "publisher-failure", "success"]
-            .into_iter()
-            .map(|name| input.path().join(name))
-            .collect();
-        for path in &paths {
-            fs::write(path, vec![b'a'; 128 * 1024]).unwrap();
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let paths: Vec<_> = ["reader-failure", "publisher-failure", "success"]
+                .into_iter()
+                .map(|name| input.path().join(name))
+                .collect();
+            for path in &paths {
+                fs::write(path, vec![b'a'; 128 * 1024]).unwrap();
+            }
+            let progress = FaultProgress(ScratchProgress::default());
+            // Every file is larger than the batch target and gets its own batch.
+            let mut compressor =
+                scratch_compressor(scratch.path(), memory, 256 * 1024, Some(64 * 1024));
+            let stats = compressor.recursive_compress(
+                paths.iter().map(PathBuf::as_path),
+                Kind::default(),
+                0.95,
+                5,
+                &progress,
+                true,
+            );
+            let errors = progress.0.errors.lock().unwrap();
+            assert_eq!(errors.len(), 2, "{errors:?}");
+            assert!(errors.iter().any(|e| e.contains("Error opening")));
+            assert!(errors
+                .iter()
+                .any(|e| e.contains("source file changed after staging")));
+            assert!(!paths[0].exists());
+            assert_eq!(fs::read(&paths[1]).unwrap(), b"changed after staging");
+            assert!(!info::get(&paths[1]).unwrap().is_compressed);
+            assert!(info::get(&paths[2]).unwrap().is_compressed);
+            assert_eq!(fs::read(&paths[2]).unwrap(), vec![b'a'; 128 * 1024]);
+            assert_eq!(
+                stats
+                    .compressed_file_count_final
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            drop(compressor);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
         }
-        let progress = FaultProgress(ScratchProgress::default());
-        // Every file is larger than the batch target and gets its own batch.
-        let mut compressor =
-            FileCompressor::with_scratch_batch(scratch.path(), 256 * 1024, 64 * 1024).unwrap();
-        let stats = compressor.recursive_compress(
-            paths.iter().map(PathBuf::as_path),
-            Kind::default(),
-            0.95,
-            5,
-            &progress,
-            true,
-        );
-        let errors = progress.0.errors.lock().unwrap();
-        assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(errors.iter().any(|e| e.contains("Error opening")));
-        assert!(errors
-            .iter()
-            .any(|e| e.contains("source file changed after staging")));
-        assert!(!paths[0].exists());
-        assert_eq!(fs::read(&paths[1]).unwrap(), b"changed after staging");
-        assert!(!info::get(&paths[1]).unwrap().is_compressed);
-        assert!(info::get(&paths[2]).unwrap().is_compressed);
-        assert_eq!(fs::read(&paths[2]).unwrap(), vec![b'a'; 128 * 1024]);
-        assert_eq!(
-            stats
-                .compressed_file_count_final
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        drop(compressor);
-        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
     }
 
     #[test]
     fn scratch_decompression_reserves_uncompressed_size_with_exact_limit() {
-        for manual in [false, true] {
+        for (manual, memory) in [false, true]
+            .into_iter()
+            .flat_map(|manual| [false, true].map(|memory| (manual, memory)))
+        {
             let input = TempDir::new().unwrap();
             let scratch = TempDir::new().unwrap();
             let exact = input.path().join("exact");
@@ -1266,7 +1329,7 @@ mod tests {
             assert!(info::get(&exact).unwrap().is_compressed);
             assert!(info::get(&oversized).unwrap().is_compressed);
             let progress = ScratchProgress::default();
-            let mut compressor = FileCompressor::with_scratch(scratch.path(), 128 * 1024).unwrap();
+            let mut compressor = scratch_compressor(scratch.path(), memory, 128 * 1024, None);
             compressor.recursive_decompress([input.path()], manual, &progress, true);
             let errors = progress.errors.lock().unwrap();
             assert_eq!(errors.len(), 1, "{errors:?}");

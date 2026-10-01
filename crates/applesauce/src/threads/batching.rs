@@ -30,7 +30,7 @@ impl<'a, P: Progress> Batch<'a, P> {
         progress: &'a P,
     ) -> Self {
         // Notifications cannot block staging workers: the coordinator receives them
-        // only once it stops admitting files. Payloads remain on disk, not in RAM.
+        // only once it stops admitting files. The scratch budget bounds payloads.
         let (completed_tx, completed_rx) = crossbeam_channel::unbounded();
         Self {
             target,

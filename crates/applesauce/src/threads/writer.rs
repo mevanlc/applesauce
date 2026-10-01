@@ -1,5 +1,5 @@
 use crate::progress::Task;
-use crate::scratch::Reservation;
+use crate::scratch::{Reservation, StagedPayload};
 use crate::threads::batching::Completion;
 use crate::threads::{BgWork, Context, Mode, WorkHandler};
 use crate::{seq_queue, set_flags, times, xattr};
@@ -13,7 +13,7 @@ use std::os::macos::fs::MetadataExt;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 use std::{cmp, io, ptr};
-use tempfile::{NamedTempFile, TempPath};
+use tempfile::NamedTempFile;
 
 pub(super) type Sender = crossbeam_channel::Sender<WorkItem>;
 
@@ -131,18 +131,27 @@ impl Handler {
             .take()
             .expect("scratch space reserved by reader");
         let scratch = item.context.operation.scratch.as_ref().unwrap();
-        let payload = scratch.tempfile()?;
-        let mut writer =
-            applesauce_core::writer::Writer::new(kind, item.context.orig_metadata.len(), || {
-                BufWriter::new(payload.as_file())
-            })?;
+        let mut payload = scratch.payload(reservation.size() - decmpfs::MAX_XATTR_SIZE as u64)?;
+        let output = &mut payload;
+        let mut writer = applesauce_core::writer::Writer::new(
+            kind,
+            item.context.orig_metadata.len(),
+            move || BufWriter::new(output),
+        )?;
         self.write_blocks(&item.context, &mut writer, item.blocks)?;
         let mut decmpfs_data = Vec::new();
         writer.finish_decmpfs_data(&mut decmpfs_data)?;
-        reservation.shrink_to(payload.as_file().metadata()?.len() + decmpfs_data.len() as u64);
+        let payload = payload.finish()?;
+        let metadata_bytes = if scratch.is_memory() {
+            decmpfs_data.shrink_to_fit();
+            decmpfs_data.capacity()
+        } else {
+            decmpfs_data.len()
+        };
+        reservation.shrink_to(payload.reserved_bytes() + metadata_bytes as u64);
         self.send_staged(
             StagedFile {
-                payload: payload.into_temp_path(),
+                payload,
                 reservation,
                 file: if item.completion.is_some() {
                     None
@@ -164,11 +173,11 @@ impl Handler {
             .take()
             .expect("scratch space reserved by reader");
         let scratch = item.context.operation.scratch.as_ref().unwrap();
-        let mut payload = scratch.tempfile()?;
+        let mut payload = scratch.payload(reservation.size())?;
         write_uncompressed_blocks(&item.context, &mut payload, item.blocks)?;
         self.send_staged(
             StagedFile {
-                payload: payload.into_temp_path(),
+                payload: payload.finish()?,
                 reservation,
                 file: if item.completion.is_some() {
                     None
@@ -379,13 +388,13 @@ impl WorkHandler<WorkItem> for Handler {
     }
 }
 
-// Drop the payload before releasing its space reservation, and keep the context
-// (which owns the scratch directory) alive through cleanup, before acknowledging completion.
+// Drop the payload and compression metadata before releasing their reservation,
+// and keep the context alive through cleanup, before acknowledging completion.
 pub(super) struct StagedFile {
-    payload: TempPath,
+    payload: StagedPayload,
+    contents: StagedContents,
     reservation: Reservation,
     file: Option<Arc<File>>,
-    contents: StagedContents,
     pub(super) context: Arc<Context>,
     pub(super) finished: Option<crossbeam_channel::Sender<()>>,
     pub(super) batch_progress: Option<Arc<dyn Task + Send + Sync>>,
@@ -393,7 +402,11 @@ pub(super) struct StagedFile {
 
 impl StagedFile {
     pub(super) fn publish_size(&self) -> u64 {
-        self.reservation.size()
+        self.payload.len()
+            + match &self.contents {
+                StagedContents::Compressed(data) => data.len() as u64,
+                StagedContents::Uncompressed => 0,
+            }
     }
 }
 
@@ -455,8 +468,8 @@ impl PublishHandler {
 
         // Copy the encoded resource fork explicitly. Copying a transparently
         // compressed file through its data fork would decompress it again.
-        let mut payload = File::open(&item.payload)?;
-        let expected = payload.metadata()?.len();
+        let mut payload = item.payload.reader()?;
+        let expected = item.payload.len();
         let copied = match &item.contents {
             StagedContents::Compressed(_) => copy_payload(
                 &mut payload,
@@ -483,6 +496,7 @@ impl PublishHandler {
                 "scratch payload size changed while copying",
             ));
         }
+        drop(payload);
         context.progress.phase("Finalizing");
         match &item.contents {
             StagedContents::Compressed(decmpfs_data) => finish_compressed_file(
@@ -519,11 +533,12 @@ impl WorkHandler<StagedFile> for PublishHandler {
                 .progress
                 .error(&format!("{}: {error}", item.context.path.display())),
         }
-        // Space becomes available only once the scratch file is gone. Deletion
-        // failure must not let reservations undercount the on-disk backlog.
+        // Release the payload and metadata before making their space available.
+        // Deletion failure must not undercount the on-disk backlog.
         let StagedFile {
             payload,
             reservation,
+            contents,
             context,
             finished,
             ..
@@ -534,6 +549,7 @@ impl WorkHandler<StagedFile> for PublishHandler {
                 .error(&format!("Error removing scratch payload: {error}"));
             reservation.stop();
         }
+        drop(contents);
         drop(reservation);
         drop(context);
         if let Some(finished) = finished {
@@ -681,12 +697,16 @@ mod tests {
         }
     }
 
-    fn stage(input: &Path, scratch_dir: &Path) -> (StagedFile, Vec<u8>) {
+    fn stage(input: &Path, scratch_dir: &Path, memory: bool) -> (StagedFile, Vec<u8>) {
         let original = vec![b'a'; 128 * 1024];
         fs::write(input, &original).unwrap();
         let metadata = input.metadata().unwrap();
         let kind = Kind::default();
-        let scratch = Arc::new(Scratch::new(scratch_dir, 1024 * 1024).unwrap());
+        let scratch = Arc::new(if memory {
+            Scratch::memory(1024 * 1024).unwrap()
+        } else {
+            Scratch::new(scratch_dir, 1024 * 1024).unwrap()
+        });
         let reservation = scratch.reserve(kind, metadata.len()).unwrap();
         let volumes = Volumes::new();
         volumes.add_root_dir(input, &metadata).unwrap();
@@ -754,48 +774,64 @@ mod tests {
 
     #[test]
     fn scratch_publishes_only_after_copy_and_verification() {
-        let input = TempDir::new().unwrap();
-        let scratch = TempDir::new().unwrap();
-        let path = input.path().join("file");
-        let (mut staged, original) = stage(&path, scratch.path());
-        let inode = path.metadata().unwrap().ino();
-        assert!(!info::get(&path).unwrap().is_compressed);
-        assert_eq!(fs::read(&path).unwrap(), original);
-        // Scratch is an ordinary file containing the encoded resource fork.
-        assert!(!info::get(&staged.payload).unwrap().is_compressed);
-        let mut publisher = Publish.make_handler();
-        publisher.publish(&mut staged).unwrap();
-        assert_ne!(path.metadata().unwrap().ino(), inode);
-        assert!(info::get(&path).unwrap().is_compressed);
-        assert_eq!(fs::read(&path).unwrap(), original);
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let path = input.path().join("file");
+            let (mut staged, original) = stage(&path, scratch.path(), memory);
+            let inode = path.metadata().unwrap().ino();
+            assert!(!info::get(&path).unwrap().is_compressed);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            match &staged.payload {
+                StagedPayload::Disk { path, .. } => {
+                    // Disk scratch is an ordinary file containing the encoded resource fork.
+                    assert!(!info::get(path).unwrap().is_compressed);
+                    assert!(!memory);
+                }
+                StagedPayload::Memory(_) => {
+                    assert!(memory);
+                    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+                }
+            }
+            let mut publisher = Publish.make_handler();
+            publisher.publish(&mut staged).unwrap();
+            assert_ne!(path.metadata().unwrap().ino(), inode);
+            assert!(info::get(&path).unwrap().is_compressed);
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
     }
 
     #[test]
     fn failed_destination_verification_leaves_original_intact() {
-        let input = TempDir::new().unwrap();
-        let scratch = TempDir::new().unwrap();
-        let path = input.path().join("file");
-        let (mut staged, mut original) = stage(&path, scratch.path());
-        let inode = path.metadata().unwrap().ino();
-        // A same-length edit after staging must be caught by destination verification.
-        original[0] = b'b';
-        fs::write(&path, &original).unwrap();
-        let error = Publish.make_handler().publish(&mut staged).unwrap_err();
-        assert!(error.to_string().contains("verification failed"));
-        assert_eq!(path.metadata().unwrap().ino(), inode);
-        assert!(!info::get(&path).unwrap().is_compressed);
-        assert_eq!(fs::read(&path).unwrap(), original);
-        drop(staged);
-        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let path = input.path().join("file");
+            let (mut staged, mut original) = stage(&path, scratch.path(), memory);
+            let inode = path.metadata().unwrap().ino();
+            // A same-length edit after staging must be caught by destination verification.
+            original[0] = b'b';
+            fs::write(&path, &original).unwrap();
+            let error = Publish.make_handler().publish(&mut staged).unwrap_err();
+            assert!(error.to_string().contains("verification failed"));
+            assert_eq!(path.metadata().unwrap().ino(), inode);
+            assert!(!info::get(&path).unwrap().is_compressed);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            drop(staged);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
     }
 
     #[test]
     fn batch_publishing_rejects_changed_or_replaced_sources() {
-        for replace in [false, true] {
+        for (replace, memory) in [false, true]
+            .into_iter()
+            .flat_map(|replace| [false, true].map(|memory| (replace, memory)))
+        {
             let input = TempDir::new().unwrap();
             let scratch = TempDir::new().unwrap();
             let path = input.path().join("file");
-            let (mut staged, mut original) = stage(&path, scratch.path());
+            let (mut staged, mut original) = stage(&path, scratch.path(), memory);
             staged.file = None;
             if replace {
                 fs::remove_file(&path).unwrap();
@@ -894,11 +930,14 @@ mod tests {
 
     #[test]
     fn scratch_decompression_verification_rejects_corrupted_payload() {
-        for mode in [Mode::DecompressByReading, Mode::DecompressManually] {
+        for (mode, memory) in [Mode::DecompressByReading, Mode::DecompressManually]
+            .into_iter()
+            .flat_map(|mode| [false, true].map(|memory| (mode, memory)))
+        {
             let input = TempDir::new().unwrap();
             let scratch = TempDir::new().unwrap();
             let path = input.path().join("file");
-            let (mut staged, original) = stage(&path, scratch.path());
+            let (mut staged, original) = stage(&path, scratch.path(), memory);
             Publish.make_handler().publish(&mut staged).unwrap();
             let inode = path.metadata().unwrap().ino();
             staged.file = Some(Arc::new(File::open(&path).unwrap()));
@@ -914,12 +953,22 @@ mod tests {
                 .unwrap()
                 .reserve_uncompressed(original.len() as u64)
                 .unwrap();
-            fs::write(&staged.payload, &original).unwrap();
-            let mut payload = fs::OpenOptions::new()
-                .write(true)
-                .open(&staged.payload)
-                .unwrap();
-            payload.write_all(b"b").unwrap();
+            match &mut staged.payload {
+                StagedPayload::Disk { path, len } => {
+                    fs::write(&*path, &original).unwrap();
+                    *len = original.len() as u64;
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .write_all(b"b")
+                        .unwrap();
+                }
+                StagedPayload::Memory(data) => {
+                    *data = original.clone();
+                    data[0] = b'b';
+                }
+            }
             staged.contents = StagedContents::Uncompressed;
             let error = Publish.make_handler().publish(&mut staged).unwrap_err();
             assert!(error.to_string().contains("verification failed"), "{error}");
@@ -935,7 +984,7 @@ mod tests {
     fn uncompressed_output_must_match_its_reserved_size() {
         let input = TempDir::new().unwrap();
         let scratch = TempDir::new().unwrap();
-        let (staged, original) = stage(&input.path().join("file"), scratch.path());
+        let (staged, original) = stage(&input.path().join("file"), scratch.path(), false);
         for size in [original.len() + 1, original.len() - 1] {
             let (tx, rx) = seq_queue::bounded(1);
             tx.prepare_send()

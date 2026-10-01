@@ -70,8 +70,8 @@ applesauce info --summary path/to/first path/to/second
 
 ### Scratch storage for slower destinations
 
-Use `--scratch DIR` with `compress` or `decompress` to stage output on a fast disk
-before copying completed files to a slower destination:
+Use `--scratch DIR` or `--scratch-memory` with `compress` or `decompress` to stage
+output on a fast disk or in RAM before copying completed files to a slower destination:
 
 ```console
 cd /Volumes/SLOWER
@@ -79,9 +79,11 @@ applesauce compress --scratch="$TMPDIR" .
 applesauce compress --scratch="$TMPDIR" --scratch-limit=32GiB --verify .
 applesauce compress --scratch="$TMPDIR" --scratch-batch .
 applesauce compress --scratch="$TMPDIR" --scratch-batch=4GiB --verify .
+applesauce compress --scratch-memory --scratch-limit=64GiB --scratch-batch .
 applesauce decompress --scratch="$TMPDIR" .
 applesauce decompress --scratch="$TMPDIR" --scratch-limit=32GiB --manual --verify .
 applesauce decompress --scratch="$TMPDIR" --scratch-batch=4GiB .
+applesauce decompress --scratch-memory --scratch-limit=64GiB --scratch-batch .
 ```
 
 Compression workers stage encoded payloads; decompression workers stage ordinary
@@ -95,22 +97,38 @@ the destination temporary file is read back and compared with the original befor
 replacement. Decompression supports both the default OS decoder and `--manual`;
 manual verification also decodes the original manually.
 
-The default scratch limit is **16 GiB**. `--scratch-limit` accepts positive
+Use `--scratch-memory` to stage the same payloads in process memory instead of a
+scratch directory. It is mutually exclusive with `--scratch DIR` and works with
+`--scratch-limit`, `--scratch-batch[=SIZE]`, every compression backend, and both
+decompression modes. Buffers allocate as output arrives and move directly to the
+copy worker without being written to a scratch file. The copy worker writes the
+encoded resource fork and compression metadata (or decompressed data) to a
+destination-volume temporary file, verifies if requested, and atomically replaces
+the original. Completed buffers are freed after publishing. Small compressed
+files can store their entire payload in the compression xattr instead of a resource fork.
+
+The default limit for disk or memory scratch is **16 GiB**. `--scratch-limit` accepts positive
 integer byte counts, decimal units such as `16GB`, and binary units such as
 `16GiB`. The limit covers active reservations and completed outputs, excluding
-filesystem allocation/metadata overhead and destination temporary files. Before
+filesystem allocation/metadata overhead and destination temporary files. Memory
+scratch counts allocated payload-buffer capacity and compression metadata, and
+excludes worker buffers, allocator overhead, transient allocations during buffer
+growth, and OS file caches. It is a staging budget, not a process-memory ceiling;
+leave RAM available for those other uses. Process memory remains subject to the
+OS's normal memory management, including swapping under memory pressure. Before
 reading a file, Applesauce reserves its worst-case compressed size, including
 format overhead, or its full uncompressed size for decompression. It waits when
-the remaining budget is insufficient, then reduces the reservation to the actual
-size when compression finishes. Space is
-released after copying and deleting the scratch payload. A file whose full
+the remaining budget is insufficient, then reduces the reservation to the stored
+payload size (allocated buffer capacity for memory scratch) and metadata when
+compression finishes. Space is released after copying and deleting or freeing
+the scratch payload. A file whose full
 reservation exceeds the limit is left unchanged with an error; increase the
 limit to process it.
 
 `--scratch-batch[=SIZE]` alternates staging and publishing whole-file batches.
 Applesauce stops admitting source reads when the next file's reservation would
 exceed the batch target, waits for all admitted files to finish staging, then
-copies the completed batch back, removes its scratch payloads, and waits for a
+copies the completed batch back, deletes or frees its scratch payloads, and waits for a
 flush of each affected destination volume before resuming source reads.
 The flush covers the volume, including other applications' pending writes.
 The final partial batch is also published. This works with both
@@ -138,8 +156,8 @@ reads from the destination can still overlap with the copy worker's writes.
 Batching separates bulk source reads from publishing, but verification and
 filesystem metadata operations can still read during publishing. Filesystem
 allocation and writeback determine physical disk access, so performance gains depend on the
-device and workload. Without `--scratch`, Applesauce uses its existing streaming
-pipeline.
+device and workload. Without `--scratch` or `--scratch-memory`, Applesauce uses
+its existing streaming pipeline.
 
 ## Features
 
@@ -205,7 +223,7 @@ See the [vendor notes](crates/applesauce-core/vendor/lzfse/README.md) for proven
 All backends write standard LZFSE files readable by macOS and Applesauce's manual
 decoder. The file's compression metadata records LZFSE, not the backend or level.
 Already-compressed files are skipped: decompress a copy first when comparing
-backends. Both streaming output and `--scratch` staging support every backend.
+backends. Streaming output, disk scratch, and memory scratch support every backend.
 
 The default backend is `crate`. Build features select a different default while
 keeping every backend available at runtime:
@@ -235,8 +253,9 @@ large files.
 #### Reduced Memory Usage
 
 afcstool will load the entire file into memory before compressing it
-(although it does attempt to use mmap for large files). Applesauce will only
-keep the block(s) currently being compressed in memory.
+(although it does attempt to use mmap for large files). By default, Applesauce
+only keeps the blocks currently being processed in memory. Opting into
+`--scratch-memory` also holds staged output within the configured scratch budget.
 
 #### Better User Interface
 

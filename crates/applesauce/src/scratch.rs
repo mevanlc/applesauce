@@ -1,49 +1,80 @@
 use applesauce_core::compressor::Kind;
 use applesauce_core::{decmpfs, num_blocks};
 use std::fs;
-use std::io;
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::{NamedTempFile, TempDir, TempPath};
 
 /// Shared by the compressor output buffers and the scratch reservation bound.
 pub(crate) const COMPRESSED_BLOCK_CAPACITY: usize = applesauce_core::BLOCK_SIZE + 1024;
 
 #[derive(Debug)]
 pub(crate) struct Scratch {
-    directory: TempDir,
+    storage: Storage,
     budget: Arc<Budget>,
-    device: u64,
-    inode: u64,
+}
+
+#[derive(Debug)]
+enum Storage {
+    Directory {
+        directory: TempDir,
+        device: u64,
+        inode: u64,
+    },
+    Memory,
 }
 
 impl Scratch {
     pub(crate) fn new(directory: &Path, limit: u64) -> io::Result<Self> {
+        let budget = Self::budget(limit)?;
+        let directory = TempDir::with_prefix_in("applesauce_scratch", directory.canonicalize()?)?;
+        let metadata = directory.path().metadata()?;
+        Ok(Self {
+            storage: Storage::Directory {
+                directory,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            budget,
+        })
+    }
+
+    pub(crate) fn memory(limit: u64) -> io::Result<Self> {
+        Ok(Self {
+            storage: Storage::Memory,
+            budget: Self::budget(limit)?,
+        })
+    }
+
+    fn budget(limit: u64) -> io::Result<Arc<Budget>> {
         if limit == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "scratch limit must be greater than zero",
             ));
         }
-        let directory = TempDir::with_prefix_in("applesauce_scratch", directory.canonicalize()?)?;
-        let metadata = directory.path().metadata()?;
-        Ok(Self {
-            directory,
-            budget: Arc::new(Budget {
-                limit,
-                used: Mutex::new(Usage::default()),
-                available: Condvar::new(),
-            }),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
+        Ok(Arc::new(Budget {
+            limit,
+            used: Mutex::new(Usage::default()),
+            available: Condvar::new(),
+        }))
     }
 
     pub(crate) fn is_temp_dir(&self, path: &Path) -> bool {
-        path.file_name() == self.directory.path().file_name()
-            && fs::symlink_metadata(path)
-                .is_ok_and(|m| m.dev() == self.device && m.ino() == self.inode)
+        match &self.storage {
+            Storage::Directory {
+                directory,
+                device,
+                inode,
+            } => {
+                path.file_name() == directory.path().file_name()
+                    && fs::symlink_metadata(path)
+                        .is_ok_and(|m| m.dev() == *device && m.ino() == *inode)
+            }
+            Storage::Memory => false,
+        }
     }
 
     pub(crate) fn reserve(&self, kind: Kind, file_size: u64) -> io::Result<Reservation> {
@@ -77,14 +108,152 @@ impl Scratch {
         self.budget.stop();
     }
 
-    pub(crate) fn tempfile(&self) -> io::Result<NamedTempFile> {
-        tempfile::Builder::new()
-            .prefix("payload")
-            .tempfile_in(self.directory.path())
+    pub(crate) fn is_memory(&self) -> bool {
+        matches!(self.storage, Storage::Memory)
+    }
+
+    pub(crate) fn payload(&self, limit: u64) -> io::Result<Payload> {
+        match &self.storage {
+            Storage::Directory { directory, .. } => tempfile::Builder::new()
+                .prefix("payload")
+                .tempfile_in(directory.path())
+                .map(Payload::Disk),
+            Storage::Memory => Ok(Payload::Memory(MemoryPayload {
+                data: Cursor::new(Vec::new()),
+                limit: usize::try_from(limit).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "memory scratch payload is too large",
+                    )
+                })?,
+            })),
+        }
     }
 
     pub(crate) fn reserve_uncompressed(&self, file_size: u64) -> io::Result<Reservation> {
         self.reserve_bytes(file_size)
+    }
+}
+
+/// Seekable staging storage for resource-fork headers as well as block data.
+pub(crate) enum Payload {
+    Disk(NamedTempFile),
+    Memory(MemoryPayload),
+}
+
+impl Payload {
+    pub(crate) fn finish(self) -> io::Result<StagedPayload> {
+        match self {
+            Self::Disk(file) => Ok(StagedPayload::Disk {
+                len: file.as_file().metadata()?.len(),
+                path: file.into_temp_path(),
+            }),
+            Self::Memory(payload) => {
+                let mut data = payload.data.into_inner();
+                data.shrink_to_fit();
+                Ok(StagedPayload::Memory(data))
+            }
+        }
+    }
+}
+
+impl Write for Payload {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Disk(file) => file.write(data),
+            Self::Memory(payload) => payload.write(data),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Disk(file) => file.flush(),
+            Self::Memory(payload) => payload.flush(),
+        }
+    }
+}
+
+impl Seek for Payload {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Disk(file) => file.seek(position),
+            Self::Memory(payload) => payload.data.seek(position),
+        }
+    }
+}
+
+pub(crate) struct MemoryPayload {
+    data: Cursor<Vec<u8>>,
+    limit: usize,
+}
+
+impl Write for MemoryPayload {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let end = self
+            .data
+            .position()
+            .checked_add(bytes.len() as u64)
+            .and_then(|end| usize::try_from(end).ok())
+            .filter(|&end| end <= self.limit)
+            .ok_or_else(|| io::Error::other("memory scratch payload exceeded its reservation"))?;
+        let data = self.data.get_mut();
+        if end > data.capacity() {
+            // Grow geometrically without allowing Vec's spare capacity to exceed
+            // the reservation. Allocate lazily and propagate allocation failures.
+            let capacity = end.max(data.capacity().saturating_mul(2)).min(self.limit);
+            data.try_reserve_exact(capacity - data.len())
+                .map_err(io::Error::other)?;
+            if data.capacity() > self.limit {
+                return Err(io::Error::other(
+                    "memory scratch allocation exceeded its reservation",
+                ));
+            }
+        }
+        self.data.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Disk handles are closed between staging and publication; memory buffers move
+/// directly into the publisher queue without copying or spilling to a file.
+pub(crate) enum StagedPayload {
+    Disk { path: TempPath, len: u64 },
+    Memory(Vec<u8>),
+}
+
+impl StagedPayload {
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::Disk { len, .. } => *len,
+            Self::Memory(data) => data.len() as u64,
+        }
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        match self {
+            Self::Disk { len, .. } => *len,
+            Self::Memory(data) => data.capacity() as u64,
+        }
+    }
+
+    pub(crate) fn reader(&self) -> io::Result<Box<dyn Read + '_>> {
+        match self {
+            Self::Disk { path, .. } => Ok(Box::new(fs::File::open(path)?)),
+            Self::Memory(data) => Ok(Box::new(Cursor::new(data.as_slice()))),
+        }
+    }
+
+    pub(crate) fn close(self) -> io::Result<()> {
+        match self {
+            Self::Disk { path, .. } => path.close(),
+            Self::Memory(_) => Ok(()),
+        }
     }
 }
 
@@ -140,7 +309,7 @@ impl Budget {
     }
 }
 
-/// Kept until the associated scratch file has been deleted, including on errors.
+/// Kept until the associated payload has been deleted or freed, including on errors.
 pub(crate) struct Reservation {
     budget: Arc<Budget>,
     bytes: u64,
@@ -180,6 +349,35 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn memory_payload_supports_headers_holes_and_bounded_growth() {
+        let scratch = Scratch::memory(32).unwrap();
+        assert!(!scratch.is_temp_dir(Path::new(".")));
+        let mut reservation = scratch.reserve_bytes(32).unwrap();
+        let mut payload = scratch.payload(reservation.size()).unwrap();
+        payload.seek(SeekFrom::Start(8)).unwrap();
+        payload.write_all(b"payload").unwrap();
+        payload.rewind().unwrap();
+        payload.write_all(b"head").unwrap();
+        payload.seek(SeekFrom::End(0)).unwrap();
+        payload.write_all(&[b'x'; 17]).unwrap();
+        assert!(payload.write_all(b"!").is_err());
+        assert!(payload.seek(SeekFrom::Current(-33)).is_err());
+        let payload = payload.finish().unwrap();
+        reservation.shrink_to(payload.reserved_bytes());
+        assert_eq!(scratch.reserved_bytes(), payload.reserved_bytes());
+        let mut bytes = Vec::new();
+        payload.reader().unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            [b"head\0\0\0\0payload".as_slice(), &[b'x'; 17]].concat()
+        );
+        assert!(matches!(payload, StagedPayload::Memory(_)));
+        payload.close().unwrap();
+        drop(reservation);
+        assert_eq!(scratch.reserved_bytes(), 0);
+    }
 
     #[test]
     fn reservations_wait_for_shrink_and_release() {

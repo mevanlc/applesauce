@@ -211,18 +211,28 @@ impl Default for Backend {
 }
 
 #[derive(Debug, clap::Args)]
+#[group(skip)]
 struct ScratchOptions {
     /// Stage output in this directory, then copy completed files to their destination one at a time
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", group = "scratch_storage")]
     scratch: Option<PathBuf>,
+
+    /// Stage output in RAM, then copy completed files to their destination one at a time
+    ///
+    /// Uses process memory without creating scratch payload files.
+    /// Works with --scratch-limit and --scratch-batch; default limit: 16GiB.
+    /// Memory used by workers, the allocator, and buffer growth is additional.
+    #[arg(long, group = "scratch_storage")]
+    scratch_memory: bool,
 
     /// Maximum scratch backlog, including reservations for files being processed (default: 16GiB)
     ///
     /// Accepts bytes or integer sizes such as 512MiB, 16GiB, or 16GB.
     /// Files whose worst-case output exceeds the limit are left unchanged.
     /// Decompression reserves the full uncompressed size of each file.
-    /// Filesystem overhead and destination temporary files are excluded.
-    #[arg(long, value_name = "SIZE", requires = "scratch", value_parser = parse_scratch_limit)]
+    /// Filesystem/allocator overhead, worker buffers, transient allocations during
+    /// buffer growth, and destination temporary files are excluded.
+    #[arg(long, value_name = "SIZE", requires = "scratch_storage", value_parser = parse_scratch_limit)]
     scratch_limit: Option<u64>,
 
     /// Stage whole-file batches, then pause source reads while copying each batch back
@@ -233,7 +243,7 @@ struct ScratchOptions {
     /// Waits for a destination-volume flush before resuming source reads.
     /// Verification and filesystem metadata operations may still read while copying.
     #[arg(
-        long, value_name = "SIZE", requires = "scratch",
+        long, value_name = "SIZE", requires = "scratch_storage",
         num_args = 0..=1, require_equals = true, value_parser = parse_scratch_limit
     )]
     scratch_batch: Option<Option<u64>>,
@@ -243,27 +253,32 @@ const DEFAULT_SCRATCH_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 
 impl ScratchOptions {
     fn file_compressor(self) -> applesauce::FileCompressor {
-        match self.scratch {
-            Some(directory) => {
-                let limit = self.scratch_limit.unwrap_or(DEFAULT_SCRATCH_LIMIT);
-                let result = match self.scratch_batch {
-                    Some(target) => applesauce::FileCompressor::with_scratch_batch(
-                        &directory,
-                        limit,
-                        target.unwrap_or(limit),
-                    ),
-                    None => applesauce::FileCompressor::with_scratch(&directory, limit),
-                };
-                result.unwrap_or_else(|error| {
-                    eprintln!(
-                        "Unable to configure scratch storage in {}: {error}",
-                        directory.display()
-                    );
-                    std::process::exit(1);
-                })
+        let limit = self.scratch_limit.unwrap_or(DEFAULT_SCRATCH_LIMIT);
+        let target = self.scratch_batch.map(|target| target.unwrap_or(limit));
+        let result = match (self.scratch.as_ref(), self.scratch_memory, target) {
+            (Some(directory), _, Some(target)) => {
+                applesauce::FileCompressor::with_scratch_batch(directory, limit, target)
             }
-            None => applesauce::FileCompressor::new(),
-        }
+            (Some(directory), _, None) => {
+                applesauce::FileCompressor::with_scratch(directory, limit)
+            }
+            (None, true, Some(target)) => {
+                applesauce::FileCompressor::with_memory_scratch_batch(limit, target)
+            }
+            (None, true, None) => applesauce::FileCompressor::with_memory_scratch(limit),
+            (None, false, _) => return applesauce::FileCompressor::new(),
+        };
+        result.unwrap_or_else(|error| {
+            if let Some(directory) = self.scratch {
+                eprintln!(
+                    "Unable to configure scratch storage in {}: {error}",
+                    directory.display()
+                );
+            } else {
+                eprintln!("Unable to configure memory scratch storage: {error}");
+            }
+            std::process::exit(1);
+        })
     }
 }
 
@@ -991,6 +1006,58 @@ fn decompress_scratch_arguments() {
             Some(512 * 1024 * 1024)
         );
         assert!(Cli::try_parse_from(["applesauce", command, "--scratch-limit=1GiB", "."]).is_err());
+    }
+}
+
+#[test]
+fn memory_scratch_arguments_and_batch_sizes() {
+    for command in ["compress", "decompress", "uncompress"] {
+        for batch in [None, Some("--scratch-batch"), Some("--scratch-batch=4GiB")] {
+            let mut args = vec![
+                "applesauce",
+                command,
+                "--scratch-memory",
+                "--scratch-limit=64GiB",
+            ];
+            args.extend(batch);
+            args.extend(["first", "second"]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let (scratch, paths) = match cli.command {
+                Commands::Compress(options) => (options.scratch_options, options.paths),
+                Commands::Decompress(options) => (options.scratch_options, options.paths),
+                Commands::Info(_) => unreachable!(),
+            };
+            assert!(scratch.scratch_memory);
+            assert!(scratch.scratch.is_none());
+            assert_eq!(scratch.scratch_limit, Some(64 * 1024 * 1024 * 1024));
+            assert_eq!(
+                scratch.scratch_batch,
+                match batch {
+                    None => None,
+                    Some("--scratch-batch") => Some(None),
+                    Some(_) => Some(Some(4 * 1024 * 1024 * 1024)),
+                }
+            );
+            assert_eq!(paths, [PathBuf::from("first"), PathBuf::from("second")]);
+        }
+        assert!(Cli::try_parse_from([
+            "applesauce",
+            command,
+            "--scratch-memory",
+            "--scratch=/tmp",
+            ".",
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from(["applesauce", command, "--scratch-memory", "."]).unwrap();
+        let scratch = match cli.command {
+            Commands::Compress(options) => options.scratch_options,
+            Commands::Decompress(options) => options.scratch_options,
+            Commands::Info(_) => unreachable!(),
+        };
+        assert_eq!(
+            scratch.scratch_limit.unwrap_or(DEFAULT_SCRATCH_LIMIT),
+            DEFAULT_SCRATCH_LIMIT
+        );
     }
 }
 
