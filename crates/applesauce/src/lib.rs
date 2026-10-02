@@ -342,7 +342,7 @@ mod tests {
     use crate::progress::{SkipReason, Task};
     use crate::volumes::Volumes;
     use std::collections::HashMap;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, MetadataExt};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -611,12 +611,16 @@ mod tests {
     struct ScratchProgress {
         errors: std::sync::Arc<Mutex<Vec<String>>>,
         paths: std::sync::Arc<Mutex<Vec<PathBuf>>>,
+        threshold_skips: std::sync::Arc<Mutex<Vec<PathBuf>>>,
     }
 
     impl Task for ScratchProgress {
         fn increment(&self, _amt: u64) {}
         fn error(&self, message: &str) {
             self.errors.lock().unwrap().push(message.to_owned());
+        }
+        fn not_compressible_enough(&self, path: &Path) {
+            self.threshold_skips.lock().unwrap().push(path.to_owned());
         }
     }
 
@@ -1197,7 +1201,8 @@ mod tests {
                 Some(4 * 1024 * 1024),
             );
             compressor.recursive_compress([input.path()], Kind::default(), 0.0, 5, &progress, true);
-            assert!(!progress.errors.lock().unwrap().is_empty());
+            assert!(progress.errors.lock().unwrap().is_empty());
+            assert_eq!(progress.threshold_skips.lock().unwrap().len(), 2);
             assert_entries_equal(&before, &recursive_read(input.path()));
             drop(compressor);
             let progress = ScratchProgress::default();
@@ -1217,6 +1222,31 @@ mod tests {
             assert!(!info::get(&large).unwrap().is_compressed);
             assert!(info::get(&small).unwrap().is_compressed);
             assert_entries_equal(&before, &recursive_read(input.path()));
+            drop(compressor);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn scratch_threshold_skips_do_not_report_errors_without_batching() {
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let path = input.path().join("file");
+            let original = vec![b'a'; 128 * 1024];
+            fs::write(&path, &original).unwrap();
+            let inode = path.metadata().unwrap().ino();
+            let progress = ScratchProgress::default();
+            let mut compressor = scratch_compressor(scratch.path(), memory, 256 * 1024, None);
+            compressor.recursive_compress([input.path()], Kind::default(), 0.0, 5, &progress, true);
+            assert!(progress.errors.lock().unwrap().is_empty());
+            assert_eq!(
+                progress.threshold_skips.lock().unwrap().as_slice(),
+                std::slice::from_ref(&path)
+            );
+            assert_eq!(path.metadata().unwrap().ino(), inode);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!info::get(&path).unwrap().is_compressed);
             drop(compressor);
             assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
         }

@@ -68,6 +68,9 @@ To print one aggregate summary for multiple paths, run:
 applesauce info --summary path/to/first path/to/second
 ```
 
+Files that do not reach the compression threshold are skipped. Use `-v` /
+`--verbose` to report these skips, including with either scratch mode.
+
 ### Scratch storage for slower destinations
 
 Use `--scratch DIR` or `--scratch-memory` with `compress` or `decompress` to stage

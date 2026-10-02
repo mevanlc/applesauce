@@ -277,7 +277,7 @@ impl Task for ProgressWithTotal {
 
     fn not_compressible_enough(&self, path: &Path) {
         if self.verbosity >= Verbosity::Verbose {
-            let message = format!("{}: Not compressible enough, file grew", path.display());
+            let message = format!("{}: Not compressible enough", path.display());
             self.total.println(message);
         }
     }

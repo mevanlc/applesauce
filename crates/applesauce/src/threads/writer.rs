@@ -12,10 +12,25 @@ use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
-use std::{cmp, io, ptr};
+use std::{cmp, fmt, io, ptr};
 use tempfile::NamedTempFile;
 
 pub(super) type Sender = crossbeam_channel::Sender<WorkItem>;
+
+#[derive(Debug)]
+struct NotCompressibleEnough(f64);
+
+impl fmt::Display for NotCompressibleEnough {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "did not compress to at least {}% of original size",
+            self.0 * 100.0
+        )
+    }
+}
+
+impl std::error::Error for NotCompressibleEnough {}
 
 pub(super) struct Chunk {
     pub block: Vec<u8>,
@@ -81,9 +96,8 @@ impl Handler {
             total_compressed_size += u64::try_from(chunk.block.len()).unwrap();
             if total_compressed_size > max_compressed_size {
                 context.progress.not_compressible_enough(&context.path);
-                return Err(io::Error::other(format!(
-                    "did not compress to at least {}% of original size",
-                    minimum_compression_ratio * 100.0
+                return Err(io::Error::other(NotCompressibleEnough(
+                    minimum_compression_ratio,
                 )));
             }
 
@@ -357,9 +371,16 @@ impl WorkHandler<WorkItem> for Handler {
                 }
             };
             if let Err(error) = result {
-                context
-                    .progress
-                    .error(&format!("{}: {error}", context.path.display()));
+                // Threshold skips already use the verbosity-aware progress callback.
+                // Other staging failures still need the ordinary error report.
+                if !error
+                    .get_ref()
+                    .is_some_and(|e| e.is::<NotCompressibleEnough>())
+                {
+                    context
+                        .progress
+                        .error(&format!("{}: {error}", context.path.display()));
+                }
             }
             return;
         }
