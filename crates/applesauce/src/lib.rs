@@ -30,6 +30,7 @@ use std::ffi::CStr;
 use std::fs::{File, Metadata};
 use std::io::prelude::*;
 use std::mem::MaybeUninit;
+use std::num::NonZeroUsize;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -203,19 +204,23 @@ impl FileCompressor {
     /// overhead and destination temporary files are not included in this limit.
     /// Decompression reserves each file's full uncompressed size.
     pub fn with_scratch(directory: impl AsRef<Path>, limit: u64) -> io::Result<Self> {
-        Self::from_scratch(scratch::Scratch::new(directory.as_ref(), limit)?, None)
+        Self::from_scratch(
+            scratch::Scratch::new(directory.as_ref(), limit)?,
+            None,
+            NonZeroUsize::MIN,
+        )
     }
 
     /// Stage compression or decompression output in process memory, then copy it
-    /// to destination-volume temporary files, one file at a time.
+    /// to destination-volume temporary files with `publishers` parallel copy workers.
     ///
     /// Uses the same worst-case reservations as [`Self::with_scratch`]. Completed
     /// compression reservations cover buffer capacity and compression metadata.
     /// `limit` excludes worker buffers, allocator overhead, temporary allocations
     /// during buffer growth, and destination files. Buffers allocate lazily and
     /// are freed after publishing; payloads are never spilled to scratch files.
-    pub fn with_memory_scratch(limit: u64) -> io::Result<Self> {
-        Self::from_scratch(scratch::Scratch::memory(limit)?, None)
+    pub fn with_memory_scratch(limit: u64, publishers: NonZeroUsize) -> io::Result<Self> {
+        Self::from_scratch(scratch::Scratch::memory(limit)?, None, publishers)
     }
 
     /// Stage whole-file batches, then pause source reads while publishing each batch.
@@ -233,6 +238,7 @@ impl FileCompressor {
         Self::from_scratch(
             scratch::Scratch::new(directory.as_ref(), limit)?,
             Some(target),
+            NonZeroUsize::MIN,
         )
     }
 
@@ -240,12 +246,21 @@ impl FileCompressor {
     /// before resuming source reads.
     ///
     /// Batch behavior matches [`Self::with_scratch_batch`]; the memory limit has
-    /// the same meaning as in [`Self::with_memory_scratch`].
-    pub fn with_memory_scratch_batch(limit: u64, target: u64) -> io::Result<Self> {
-        Self::from_scratch(scratch::Scratch::memory(limit)?, Some(target))
+    /// the same meaning as in [`Self::with_memory_scratch`]. `publishers` controls
+    /// parallel destination copies; all finish before the batch's volume flush.
+    pub fn with_memory_scratch_batch(
+        limit: u64,
+        target: u64,
+        publishers: NonZeroUsize,
+    ) -> io::Result<Self> {
+        Self::from_scratch(scratch::Scratch::memory(limit)?, Some(target), publishers)
     }
 
-    fn from_scratch(scratch: scratch::Scratch, target: Option<u64>) -> io::Result<Self> {
+    fn from_scratch(
+        scratch: scratch::Scratch,
+        target: Option<u64>,
+        publishers: NonZeroUsize,
+    ) -> io::Result<Self> {
         if target.is_some_and(|target| target == 0 || target > scratch.limit()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -256,6 +271,7 @@ impl FileCompressor {
             bg_threads: BackgroundThreads::with_scratch_batch(
                 Some(std::sync::Arc::new(scratch)),
                 target,
+                publishers,
             ),
         })
     }
@@ -612,6 +628,33 @@ mod tests {
         errors: std::sync::Arc<Mutex<Vec<String>>>,
         paths: std::sync::Arc<Mutex<Vec<PathBuf>>>,
         threshold_skips: std::sync::Arc<Mutex<Vec<PathBuf>>>,
+        publishers: Option<std::sync::Arc<PublishRendezvous>>,
+    }
+
+    struct PublishRendezvous {
+        expected: usize,
+        threads: Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+        ready: std::sync::Condvar,
+        timed_out: std::sync::atomic::AtomicBool,
+    }
+
+    impl PublishRendezvous {
+        fn arrive(&self) {
+            use std::sync::atomic::Ordering;
+            let mut threads = self.threads.lock().unwrap();
+            threads.insert(std::thread::current().id());
+            self.ready.notify_all();
+            let (_threads, result) = self
+                .ready
+                .wait_timeout_while(threads, std::time::Duration::from_secs(5), |threads| {
+                    threads.len() < self.expected && !self.timed_out.load(Ordering::Relaxed)
+                })
+                .unwrap();
+            if result.timed_out() {
+                self.timed_out.store(true, Ordering::Relaxed);
+                self.ready.notify_all();
+            }
+        }
     }
 
     impl Task for ScratchProgress {
@@ -621,6 +664,13 @@ mod tests {
         }
         fn not_compressible_enough(&self, path: &Path) {
             self.threshold_skips.lock().unwrap().push(path.to_owned());
+        }
+        fn phase(&self, phase: &'static str) {
+            if phase == "Copying from scratch" {
+                if let Some(publishers) = &self.publishers {
+                    publishers.arrive();
+                }
+            }
         }
     }
 
@@ -641,13 +691,71 @@ mod tests {
         limit: u64,
         target: Option<u64>,
     ) -> FileCompressor {
+        let publishers = NonZeroUsize::new(4).unwrap();
         match (memory, target) {
             (false, None) => FileCompressor::with_scratch(directory, limit),
             (false, Some(target)) => FileCompressor::with_scratch_batch(directory, limit, target),
-            (true, None) => FileCompressor::with_memory_scratch(limit),
-            (true, Some(target)) => FileCompressor::with_memory_scratch_batch(limit, target),
+            (true, None) => FileCompressor::with_memory_scratch(limit, publishers),
+            (true, Some(target)) => {
+                FileCompressor::with_memory_scratch_batch(limit, target, publishers)
+            }
         }
         .unwrap()
+    }
+
+    #[test]
+    fn memory_scratch_uses_requested_publishers_with_and_without_batches() {
+        use std::sync::atomic::Ordering;
+        for (publishers, batched) in [1, 4]
+            .into_iter()
+            .flat_map(|publishers| [false, true].map(move |batched| (publishers, batched)))
+        {
+            let input = TempDir::new().unwrap();
+            for n in 0..32 {
+                fs::write(input.path().join(format!("file-{n}")), [b'a'; 16 * 1024]).unwrap();
+            }
+            let before = recursive_read(input.path());
+            let count = NonZeroUsize::new(publishers).unwrap();
+            let limit = 8 * 1024 * 1024;
+            let mut compressor = if batched {
+                FileCompressor::with_memory_scratch_batch(limit, limit, count)
+            } else {
+                FileCompressor::with_memory_scratch(limit, count)
+            }
+            .unwrap();
+            for compressing in [true, false] {
+                let probe = std::sync::Arc::new(PublishRendezvous {
+                    expected: publishers,
+                    threads: Mutex::default(),
+                    ready: std::sync::Condvar::new(),
+                    timed_out: std::sync::atomic::AtomicBool::new(false),
+                });
+                let progress = ScratchProgress {
+                    publishers: Some(std::sync::Arc::clone(&probe)),
+                    ..ScratchProgress::default()
+                };
+                let stats = if compressing {
+                    compressor.recursive_compress(
+                        [input.path()],
+                        Kind::default(),
+                        0.95,
+                        5,
+                        &progress,
+                        true,
+                    )
+                } else {
+                    compressor.recursive_decompress([input.path()], false, &progress, true)
+                };
+                assert!(!probe.timed_out.load(Ordering::Relaxed));
+                assert_eq!(probe.threads.lock().unwrap().len(), publishers);
+                assert!(progress.errors.lock().unwrap().is_empty());
+                assert_eq!(
+                    stats.compressed_file_count_final.load(Ordering::Relaxed),
+                    if compressing { 32 } else { 0 },
+                );
+                assert_entries_equal(&before, &recursive_read(input.path()));
+            }
+        }
     }
 
     #[test]
@@ -861,9 +969,9 @@ mod tests {
         assert!(FileCompressor::with_scratch(input.path(), 0).is_err());
         assert!(FileCompressor::with_scratch_batch(input.path(), 1024, 0).is_err());
         assert!(FileCompressor::with_scratch_batch(input.path(), 1024, 1025).is_err());
-        assert!(FileCompressor::with_memory_scratch(0).is_err());
-        assert!(FileCompressor::with_memory_scratch_batch(1024, 0).is_err());
-        assert!(FileCompressor::with_memory_scratch_batch(1024, 1025).is_err());
+        assert!(FileCompressor::with_memory_scratch(0, NonZeroUsize::MIN).is_err());
+        assert!(FileCompressor::with_memory_scratch_batch(1024, 0, NonZeroUsize::MIN).is_err());
+        assert!(FileCompressor::with_memory_scratch_batch(1024, 1025, NonZeroUsize::MIN).is_err());
         assert_eq!(fs::read_dir(input.path()).unwrap().count(), 0);
     }
 

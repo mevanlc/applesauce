@@ -73,7 +73,7 @@ Files that do not reach the compression threshold are skipped. Use `-v` /
 
 ### Scratch storage for slower destinations
 
-Use `--scratch DIR` or `--scratch-memory` with `compress` or `decompress` to stage
+Use `--scratch DIR` or `--scratch-memory[=N]` with `compress` or `decompress` to stage
 output on a fast disk or in RAM before copying completed files to a slower destination:
 
 ```console
@@ -83,6 +83,8 @@ applesauce compress --scratch="$TMPDIR" --scratch-limit=32GiB --verify .
 applesauce compress --scratch="$TMPDIR" --scratch-batch .
 applesauce compress --scratch="$TMPDIR" --scratch-batch=4GiB --verify .
 applesauce compress --scratch-memory --scratch-limit=64GiB --scratch-batch .
+applesauce compress --scratch-memory=1 --scratch-limit=64GiB --scratch-batch .
+applesauce compress --scratch-memory=8 --scratch-limit=32GiB .
 applesauce decompress --scratch="$TMPDIR" .
 applesauce decompress --scratch="$TMPDIR" --scratch-limit=32GiB --manual --verify .
 applesauce decompress --scratch="$TMPDIR" --scratch-batch=4GiB .
@@ -90,8 +92,9 @@ applesauce decompress --scratch-memory --scratch-limit=64GiB --scratch-batch .
 ```
 
 Compression workers stage encoded payloads; decompression workers stage ordinary
-uncompressed data. Both use a private temporary directory under `DIR`.
-One copy worker transfers completed payloads in sequential chunks of up to 4 MiB
+uncompressed data. Disk scratch uses a private temporary directory under `DIR`
+and one copy worker. RAM scratch uses the configured number of copy workers.
+Each worker transfers completed payloads in sequential chunks of up to 4 MiB
 to temporary files on the destination volume, then atomically
 renames each completed file over its original. The scratch directory need not
 support APFS compression. Destination files still require a filesystem that
@@ -100,11 +103,16 @@ the destination temporary file is read back and compared with the original befor
 replacement. Decompression supports both the default OS decoder and `--manual`;
 manual verification also decodes the original manually.
 
-Use `--scratch-memory` to stage the same payloads in process memory instead of a
-scratch directory. It is mutually exclusive with `--scratch DIR` and works with
+Use `--scratch-memory[=N]` to stage the same payloads in process memory instead of a
+scratch directory. `N` is the number of parallel destination copy workers;
+bare `--scratch-memory` uses **4**. An explicit count requires `=` and must be
+a positive integer. Use `--scratch-memory=1` for serial publishing, or increase
+the count for more destination concurrency. The count applies to compression,
+decompression, and batch mode; all copies finish before a batch's volume flush.
+It is mutually exclusive with `--scratch DIR` and works with
 `--scratch-limit`, `--scratch-batch[=SIZE]`, every compression backend, and both
 decompression modes. Buffers allocate as output arrives and move directly to the
-copy worker without being written to a scratch file. The copy worker writes the
+copy workers without being written to a scratch file. Each copy worker writes the
 encoded resource fork and compression metadata (or decompressed data) to a
 destination-volume temporary file, verifies if requested, and atomically replaces
 the original. Completed buffers are freed after publishing. Small compressed
@@ -116,7 +124,8 @@ integer byte counts, decimal units such as `16GB`, and binary units such as
 filesystem allocation/metadata overhead and destination temporary files. Memory
 scratch counts allocated payload-buffer capacity and compression metadata, and
 excludes worker buffers, allocator overhead, transient allocations during buffer
-growth, and OS file caches. It is a staging budget, not a process-memory ceiling;
+growth, and OS file caches. Each copy worker has a 4 MiB buffer outside this limit.
+It is a staging budget, not a process-memory ceiling;
 leave RAM available for those other uses. Process memory remains subject to the
 OS's normal memory management, including swapping under memory pressure. Before
 reading a file, Applesauce reserves its worst-case compressed size, including
@@ -155,7 +164,7 @@ have their handles closed until publishing, so large batches of small files do
 not keep an open handle for every source and payload.
 
 Scratch storage is removed on normal completion. Without `--scratch-batch`,
-reads from the destination can still overlap with the copy worker's writes.
+reads from the destination can still overlap with the copy workers' writes.
 Batching separates bulk source reads from publishing, but verification and
 filesystem metadata operations can still read during publishing. Filesystem
 allocation and writeback determine physical disk access, so performance gains depend on the

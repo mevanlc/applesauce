@@ -8,6 +8,7 @@ use clap::Parser;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufWriter, LineWriter};
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
@@ -217,13 +218,18 @@ struct ScratchOptions {
     #[arg(long, value_name = "DIR", group = "scratch_storage")]
     scratch: Option<PathBuf>,
 
-    /// Stage output in RAM, then copy completed files to their destination one at a time
+    /// Stage output in RAM, then publish completed files with N workers (default: 4)
     ///
+    /// An explicit worker count requires '=', as in --scratch-memory=1.
+    /// N must be a positive integer and controls destination copying and finalization.
     /// Uses process memory without creating scratch payload files.
     /// Works with --scratch-limit and --scratch-batch; default limit: 16GiB.
     /// Memory used by workers, the allocator, and buffer growth is additional.
-    #[arg(long, group = "scratch_storage")]
-    scratch_memory: bool,
+    #[arg(
+        long, value_name = "N", group = "scratch_storage",
+        num_args = 0..=1, require_equals = true, default_missing_value = "4"
+    )]
+    scratch_memory: Option<NonZeroUsize>,
 
     /// Maximum scratch backlog, including reservations for files being processed (default: 16GiB)
     ///
@@ -262,11 +268,13 @@ impl ScratchOptions {
             (Some(directory), _, None) => {
                 applesauce::FileCompressor::with_scratch(directory, limit)
             }
-            (None, true, Some(target)) => {
-                applesauce::FileCompressor::with_memory_scratch_batch(limit, target)
+            (None, Some(publishers), Some(target)) => {
+                applesauce::FileCompressor::with_memory_scratch_batch(limit, target, publishers)
             }
-            (None, true, None) => applesauce::FileCompressor::with_memory_scratch(limit),
-            (None, false, _) => return applesauce::FileCompressor::new(),
+            (None, Some(publishers), None) => {
+                applesauce::FileCompressor::with_memory_scratch(limit, publishers)
+            }
+            (None, None, _) => return applesauce::FileCompressor::new(),
         };
         result.unwrap_or_else(|error| {
             if let Some(directory) = self.scratch {
@@ -1012,42 +1020,38 @@ fn decompress_scratch_arguments() {
 #[test]
 fn memory_scratch_arguments_and_batch_sizes() {
     for command in ["compress", "decompress", "uncompress"] {
-        for batch in [None, Some("--scratch-batch"), Some("--scratch-batch=4GiB")] {
-            let mut args = vec![
-                "applesauce",
-                command,
-                "--scratch-memory",
-                "--scratch-limit=64GiB",
-            ];
-            args.extend(batch);
-            args.extend(["first", "second"]);
-            let cli = Cli::try_parse_from(args).unwrap();
-            let (scratch, paths) = match cli.command {
-                Commands::Compress(options) => (options.scratch_options, options.paths),
-                Commands::Decompress(options) => (options.scratch_options, options.paths),
-                Commands::Info(_) => unreachable!(),
-            };
-            assert!(scratch.scratch_memory);
-            assert!(scratch.scratch.is_none());
-            assert_eq!(scratch.scratch_limit, Some(64 * 1024 * 1024 * 1024));
-            assert_eq!(
-                scratch.scratch_batch,
-                match batch {
-                    None => None,
-                    Some("--scratch-batch") => Some(None),
-                    Some(_) => Some(Some(4 * 1024 * 1024 * 1024)),
-                }
+        for (flag, publishers) in [
+            ("--scratch-memory", 4),
+            ("--scratch-memory=1", 1),
+            ("--scratch-memory=16", 16),
+        ] {
+            for batch in [None, Some("--scratch-batch"), Some("--scratch-batch=4GiB")] {
+                let mut args = vec!["applesauce", command, flag, "--scratch-limit=64GiB"];
+                args.extend(batch);
+                args.extend(["first", "second"]);
+                let cli = Cli::try_parse_from(args).unwrap();
+                let (scratch, paths) = match cli.command {
+                    Commands::Compress(options) => (options.scratch_options, options.paths),
+                    Commands::Decompress(options) => (options.scratch_options, options.paths),
+                    Commands::Info(_) => unreachable!(),
+                };
+                assert_eq!(scratch.scratch_memory, NonZeroUsize::new(publishers));
+                assert!(scratch.scratch.is_none());
+                assert_eq!(scratch.scratch_limit, Some(64 * 1024 * 1024 * 1024));
+                assert_eq!(
+                    scratch.scratch_batch,
+                    match batch {
+                        None => None,
+                        Some("--scratch-batch") => Some(None),
+                        Some(_) => Some(Some(4 * 1024 * 1024 * 1024)),
+                    }
+                );
+                assert_eq!(paths, [PathBuf::from("first"), PathBuf::from("second")]);
+            }
+            assert!(
+                Cli::try_parse_from(["applesauce", command, flag, "--scratch=/tmp", ".",]).is_err()
             );
-            assert_eq!(paths, [PathBuf::from("first"), PathBuf::from("second")]);
         }
-        assert!(Cli::try_parse_from([
-            "applesauce",
-            command,
-            "--scratch-memory",
-            "--scratch=/tmp",
-            ".",
-        ])
-        .is_err());
         let cli = Cli::try_parse_from(["applesauce", command, "--scratch-memory", "."]).unwrap();
         let scratch = match cli.command {
             Commands::Compress(options) => options.scratch_options,
@@ -1058,6 +1062,30 @@ fn memory_scratch_arguments_and_batch_sizes() {
             scratch.scratch_limit.unwrap_or(DEFAULT_SCRATCH_LIMIT),
             DEFAULT_SCRATCH_LIMIT
         );
+    }
+}
+
+#[test]
+fn memory_scratch_requires_positive_publisher_count_and_preserves_numeric_paths() {
+    for command in ["compress", "decompress", "uncompress"] {
+        for flag in [
+            "--scratch-memory=0",
+            "--scratch-memory=",
+            "--scratch-memory=-1",
+            "--scratch-memory=invalid",
+            "--scratch-memory=4GiB",
+            "--scratch-memory=184467440737095516160",
+        ] {
+            assert!(Cli::try_parse_from(["applesauce", command, flag, "."]).is_err());
+        }
+        let cli = Cli::try_parse_from(["applesauce", command, "--scratch-memory", "16"]).unwrap();
+        let (scratch, paths) = match cli.command {
+            Commands::Compress(options) => (options.scratch_options, options.paths),
+            Commands::Decompress(options) => (options.scratch_options, options.paths),
+            Commands::Info(_) => unreachable!(),
+        };
+        assert_eq!(scratch.scratch_memory, NonZeroUsize::new(4));
+        assert_eq!(paths, [PathBuf::from("16")]);
     }
 }
 

@@ -157,19 +157,22 @@ impl BackgroundThreads {
     }
 
     pub(crate) fn with_scratch(scratch: Option<Arc<Scratch>>) -> Self {
-        Self::with_scratch_batch(scratch, None)
+        Self::with_scratch_batch(scratch, None, NonZeroUsize::MIN)
     }
 
     pub(crate) fn with_scratch_batch(
         scratch: Option<Arc<Scratch>>,
         batch_target: Option<u64>,
+        publishers: NonZeroUsize,
     ) -> Self {
         let compressor_threads = thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1);
 
         let compressor = BgWorker::new(compressor_threads, &compressing::Work);
-        let publisher = scratch.as_ref().map(|_| BgWorker::new(1, &writer::Publish));
+        let publisher = scratch
+            .as_ref()
+            .map(|_| BgWorker::new(publishers.get(), &writer::Publish));
         let writer = BgWorker::new(
             16,
             &writer::Work {
