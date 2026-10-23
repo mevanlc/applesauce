@@ -14,6 +14,9 @@ pub enum SkipReason {
     HasRequiredXattr,
     FsNotSupported,
     HardLink,
+    ProtectedFlags,
+    OpenWriter,
+    OpenWriterCheckFailed(io::Error),
 }
 
 impl From<IncompressibleReason> for SkipReason {
@@ -46,6 +49,7 @@ pub trait Task {
     fn increment(&self, amt: u64);
     fn error(&self, message: &str);
     fn not_compressible_enough(&self, _path: &Path) {}
+    fn file_skipped(&self, _path: &Path, _why: SkipReason) {}
     fn phase(&self, _message: &'static str) {}
 }
 
@@ -84,6 +88,9 @@ impl<T: Task> Task for &'_ T {
     fn not_compressible_enough(&self, path: &Path) {
         T::not_compressible_enough(self, path)
     }
+    fn file_skipped(&self, path: &Path, why: SkipReason) {
+        T::file_skipped(self, path, why)
+    }
 }
 
 impl fmt::Display for SkipReason {
@@ -99,6 +106,11 @@ impl fmt::Display for SkipReason {
             SkipReason::FsNotSupported => write!(f, "Filesystem does not support compression"),
             SkipReason::EmptyFile => write!(f, "Empty file"),
             SkipReason::HardLink => write!(f, "Other hard links exist to file"),
+            SkipReason::ProtectedFlags => write!(f, "File has protected flags"),
+            SkipReason::OpenWriter => write!(f, "File has an open writer"),
+            SkipReason::OpenWriterCheckFailed(ref err) => {
+                write!(f, "Could not check for open writers: {err}")
+            }
         }
     }
 }

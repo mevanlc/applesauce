@@ -358,6 +358,7 @@ mod tests {
     use crate::progress::{SkipReason, Task};
     use crate::volumes::Volumes;
     use std::collections::HashMap;
+    use std::os::macos::fs::MetadataExt as _;
     use std::os::unix::fs::{symlink, MetadataExt};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -520,14 +521,14 @@ mod tests {
 
     #[test]
     fn compress_single_file() {
-        let mut compressible_file = tempfile::NamedTempFile::new().unwrap();
-        compressible_file.write_all(&[0; 16 * 1024]).unwrap();
-        compressible_file.flush().unwrap();
-        let contents = recursive_read(compressible_file.path());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("compressible");
+        fs::write(&path, [0; 16 * 1024]).unwrap();
+        let contents = recursive_read(&path);
 
         let mut fc = FileCompressor::new();
         fc.recursive_compress(
-            iter::once(compressible_file.path()),
+            iter::once(path.as_path()),
             Kind::default(),
             1.0,
             5,
@@ -535,10 +536,10 @@ mod tests {
             true,
         );
 
-        let new_contents = recursive_read(compressible_file.path());
+        let new_contents = recursive_read(&path);
         assert_entries_equal(&contents, &new_contents);
 
-        let info = info::get_recursive(compressible_file.path()).unwrap();
+        let info = info::get_recursive(&path).unwrap();
         // These are very compressible files
         assert!(info.compression_savings_fraction() > 0.5);
     }
@@ -621,6 +622,55 @@ mod tests {
 
         assert!(!info::get(&orig_file).unwrap().is_compressed);
         assert!(!info::get(&second_file).unwrap().is_compressed);
+    }
+
+    #[test]
+    fn compress_skips_append_only_files_before_staging() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("active.jsonl");
+        fs::write(&path, vec![b'a'; 128 * 1024]).unwrap();
+        let file = File::options().read(true).write(true).open(&path).unwrap();
+        let flags = file.metadata().unwrap().st_flags();
+        set_flags(&file, flags | libc::UF_APPEND).unwrap();
+        let inode = file.metadata().unwrap().ino();
+        let progress = MockProgress {
+            skip_reasons: Mutex::new(HashMap::new()),
+        };
+        FileCompressor::new().recursive_compress(
+            [path.as_path()],
+            Kind::default(),
+            0.95,
+            5,
+            &progress,
+            false,
+        );
+        assert!(matches!(
+            progress.skip_reasons.lock().unwrap().get(&path),
+            Some(SkipReason::ProtectedFlags)
+        ));
+        assert_eq!(path.metadata().unwrap().ino(), inode);
+        assert!(!info::get(&path).unwrap().is_compressed);
+        set_flags(&file, flags).unwrap();
+    }
+
+    #[test]
+    fn compress_skips_file_with_an_open_writer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("active.jsonl");
+        fs::write(&path, vec![b'a'; 128 * 1024]).unwrap();
+        let inode = path.metadata().unwrap().ino();
+        let writer = File::options().append(true).open(&path).unwrap();
+        FileCompressor::new().recursive_compress(
+            [path.as_path()],
+            Kind::default(),
+            0.95,
+            5,
+            &NoProgress,
+            false,
+        );
+        assert_eq!(path.metadata().unwrap().ino(), inode);
+        assert!(!info::get(&path).unwrap().is_compressed);
+        drop(writer);
     }
 
     #[derive(Clone, Default)]

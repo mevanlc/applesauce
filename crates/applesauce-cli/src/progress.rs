@@ -184,7 +184,10 @@ impl Progress for ProgressBars {
             | SkipReason::ZfsFilesystem
             | SkipReason::HasRequiredXattr
             | SkipReason::FsNotSupported
-            | SkipReason::HardLink => Verbosity::Normal,
+            | SkipReason::HardLink
+            | SkipReason::ProtectedFlags
+            | SkipReason::OpenWriter
+            | SkipReason::OpenWriterCheckFailed(_) => Verbosity::Normal,
         };
         if self.verbosity >= required_verbosity {
             self.total_bar
@@ -279,6 +282,13 @@ impl Task for ProgressWithTotal {
         if self.verbosity >= Verbosity::Verbose {
             let message = format!("{}: Not compressible enough", path.display());
             self.total.println(message);
+        }
+    }
+
+    fn file_skipped(&self, path: &Path, why: SkipReason) {
+        if self.verbosity >= Verbosity::Normal {
+            self.total
+                .println(format!("{}: Skipped: {why}", path.display()));
         }
     }
 }

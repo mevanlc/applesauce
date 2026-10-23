@@ -1,6 +1,7 @@
 use crate::progress::Task;
 use crate::scratch::{Reservation, StagedPayload};
 use crate::threads::batching::Completion;
+use crate::threads::source_guard;
 use crate::threads::{BgWork, Context, Mode, WorkHandler};
 use crate::{seq_queue, set_flags, times, xattr};
 use applesauce_core::compressor::Kind;
@@ -10,7 +11,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::macos::fs::MetadataExt;
-use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 use std::{cmp, fmt, io, ptr};
 use tempfile::NamedTempFile;
@@ -111,11 +111,7 @@ impl Handler {
         Ok(())
     }
 
-    fn write_compressed_file(
-        &mut self,
-        mut item: WorkItem,
-        compressor_kind: Kind,
-    ) -> io::Result<()> {
+    fn write_compressed_file(&mut self, item: WorkItem, compressor_kind: Kind) -> io::Result<bool> {
         let uncompressed_file_size = item.context.orig_metadata.len();
 
         let tmp_file = tmp_file_for(&item)?;
@@ -132,7 +128,7 @@ impl Handler {
         writer.finish_decmpfs_data(&mut self.decomp_xattr_val_buf)?;
         finish_compressed_file(
             &item.context,
-            &mut item.file,
+            item.file,
             tmp_file,
             &self.decomp_xattr_val_buf,
             None,
@@ -220,11 +216,11 @@ impl Handler {
             .map_err(|_| io::Error::other("scratch copy worker stopped"))
     }
 
-    fn write_uncompressed_file(&mut self, mut item: WorkItem) -> io::Result<()> {
+    fn write_uncompressed_file(&mut self, item: WorkItem) -> io::Result<bool> {
         let mut tmp_file = tmp_file_for(&item)?;
         copy_xattrs(&item.file, tmp_file.as_file())?;
         write_uncompressed_blocks(&item.context, &mut tmp_file, item.blocks)?;
-        finish_uncompressed_file(&item.context, &mut item.file, tmp_file)
+        finish_uncompressed_file(&item.context, item.file, tmp_file)
     }
 }
 
@@ -255,25 +251,26 @@ fn write_uncompressed_blocks(
 
 fn finish_uncompressed_file(
     context: &Context,
-    original: &mut Arc<File>,
+    mut original: Arc<File>,
     mut tmp_file: NamedTempFile,
-) -> io::Result<()> {
-    copy_metadata(original, tmp_file.as_file())?;
+) -> io::Result<bool> {
+    copy_metadata(&original, tmp_file.as_file())?;
     set_flags(
         tmp_file.as_file(),
-        context.orig_metadata.st_flags() & !libc::UF_COMPRESSED,
+        context.orig_metadata.st_flags() & !(libc::UF_COMPRESSED | source_guard::PROTECTED_FLAGS),
     )?;
-    verify_file(context, original, tmp_file.as_file_mut())?;
+    verify_file(context, &mut original, tmp_file.as_file_mut())?;
+    drop(original);
     persist_file(context, tmp_file)
 }
 
 fn finish_compressed_file(
     context: &Context,
-    original: &mut Arc<File>,
+    mut original: Arc<File>,
     mut tmp_file: NamedTempFile,
     decmpfs_data: &[u8],
     batch_progress: Option<&(dyn Task + Send + Sync)>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     {
         let _entered = tracing::debug_span!("set decmpfs xattr").entered();
         xattr::set(tmp_file.as_file(), decmpfs::XATTR_NAME, decmpfs_data, 0)?;
@@ -282,13 +279,14 @@ fn finish_compressed_file(
         }
     }
 
-    copy_metadata(original, tmp_file.as_file())?;
+    copy_metadata(&original, tmp_file.as_file())?;
     set_flags(
         tmp_file.as_file(),
-        context.orig_metadata.st_flags() | libc::UF_COMPRESSED,
+        (context.orig_metadata.st_flags() & !source_guard::PROTECTED_FLAGS) | libc::UF_COMPRESSED,
     )?;
 
-    verify_file(context, original, tmp_file.as_file_mut())?;
+    verify_file(context, &mut original, tmp_file.as_file_mut())?;
+    drop(original);
     persist_file(context, tmp_file)
 }
 
@@ -344,7 +342,11 @@ fn verify_manually(original: &File, destination: &mut File) -> io::Result<()> {
     Ok(())
 }
 
-fn persist_file(context: &Context, tmp_file: NamedTempFile) -> io::Result<()> {
+fn persist_file(context: &Context, tmp_file: NamedTempFile) -> io::Result<bool> {
+    if let Some(reason) = source_guard::before_publish(context)? {
+        context.progress.file_skipped(&context.path, reason);
+        return Ok(false);
+    }
     let new_file = {
         let _entered = tracing::debug_span!("rename tmp file").entered();
         tmp_file.persist(&context.path)?
@@ -355,7 +357,7 @@ fn persist_file(context: &Context, tmp_file: NamedTempFile) -> io::Result<()> {
     if let Err(e) = times::reset_times(&new_file, &context.orig_times) {
         tracing::error!("Unable to reset times: {e}");
     }
-    Ok(())
+    Ok(true)
 }
 
 impl WorkHandler<WorkItem> for Handler {
@@ -393,7 +395,7 @@ impl WorkHandler<WorkItem> for Handler {
         };
 
         match res {
-            Ok(()) => {
+            Ok(true) => {
                 context.report_new_stats();
                 let compressing = context.operation.mode.is_compressing();
                 let prefix = if compressing { "" } else { "de" };
@@ -404,7 +406,7 @@ impl WorkHandler<WorkItem> for Handler {
                     .progress
                     .error(&format!("{}: {error}", context.path.display()));
             }
-            Err(_) => {}
+            Ok(false) | Err(_) => {}
         }
     }
 }
@@ -459,7 +461,7 @@ pub(super) struct PublishHandler {
 }
 
 impl PublishHandler {
-    fn publish(&mut self, item: &mut StagedFile) -> io::Result<()> {
+    fn publish(&mut self, item: &mut StagedFile) -> io::Result<bool> {
         let context = &item.context;
         let _span =
             tracing::info_span!("copying from scratch", path=%context.path.display()).entered();
@@ -468,18 +470,13 @@ impl PublishHandler {
             .operation
             .volumes
             .tempfile_for(&context.path, &context.orig_metadata)?;
-        let mut original = match item.file.take() {
+        let original = match item.file.take() {
             Some(file) => file,
             None => {
                 let file = File::open(&context.path)?;
                 let metadata = file.metadata()?;
                 let saved = &context.orig_metadata;
-                if metadata.dev() != saved.dev()
-                    || metadata.ino() != saved.ino()
-                    || metadata.len() != saved.len()
-                    || metadata.modified()? != saved.modified()?
-                    || metadata.nlink() != saved.nlink()
-                {
+                if !source_guard::same_source(&metadata, saved) {
                     return Err(io::Error::other("source file changed after staging"));
                 }
                 Arc::new(file)
@@ -522,14 +519,12 @@ impl PublishHandler {
         match &item.contents {
             StagedContents::Compressed(decmpfs_data) => finish_compressed_file(
                 context,
-                &mut original,
+                original,
                 tmp_file,
                 decmpfs_data,
                 item.batch_progress.as_deref(),
             ),
-            StagedContents::Uncompressed => {
-                finish_uncompressed_file(context, &mut original, tmp_file)
-            }
+            StagedContents::Uncompressed => finish_uncompressed_file(context, original, tmp_file),
         }
     }
 }
@@ -537,7 +532,7 @@ impl PublishHandler {
 impl WorkHandler<StagedFile> for PublishHandler {
     fn handle_item(&mut self, mut item: StagedFile) {
         match self.publish(&mut item) {
-            Ok(()) => {
+            Ok(true) => {
                 item.context.report_new_stats();
                 let prefix = if item.context.operation.mode.is_compressing() {
                     ""
@@ -549,6 +544,7 @@ impl WorkHandler<StagedFile> for PublishHandler {
                     item.context.path.display()
                 );
             }
+            Ok(false) => {}
             Err(error) => item
                 .context
                 .progress
@@ -706,6 +702,7 @@ mod tests {
     use crate::threads::OperationContext;
     use crate::volumes::Volumes;
     use std::fs;
+    use std::os::macos::fs::MetadataExt as _;
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -719,6 +716,15 @@ mod tests {
     }
 
     fn stage(input: &Path, scratch_dir: &Path, memory: bool) -> (StagedFile, Vec<u8>) {
+        stage_with_verify(input, scratch_dir, memory, true)
+    }
+
+    fn stage_with_verify(
+        input: &Path,
+        scratch_dir: &Path,
+        memory: bool,
+        verify: bool,
+    ) -> (StagedFile, Vec<u8>) {
         let original = vec![b'a'; 128 * 1024];
         fs::write(input, &original).unwrap();
         let metadata = input.metadata().unwrap();
@@ -743,7 +749,7 @@ mod tests {
                 },
                 finished_stats,
                 volumes,
-                true,
+                verify,
                 Some(scratch),
             )),
             path: input.to_owned(),
@@ -819,6 +825,67 @@ mod tests {
             assert_ne!(path.metadata().unwrap().ino(), inode);
             assert!(info::get(&path).unwrap().is_compressed);
             assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn scratch_skips_an_open_writer_without_replacing_the_file() {
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let path = input.path().join("file");
+            let (mut staged, original) = stage(&path, scratch.path(), memory);
+            let inode = path.metadata().unwrap().ino();
+            let writer = File::options().append(true).open(&path).unwrap();
+            assert!(!Publish.make_handler().publish(&mut staged).unwrap());
+            assert_eq!(path.metadata().unwrap().ino(), inode);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            drop(writer);
+            drop(staged);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn scratch_skips_source_protected_after_staging_without_leaking_temp_file() {
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let path = input.path().join("file");
+            let (mut staged, original) = stage(&path, scratch.path(), memory);
+            let inode = path.metadata().unwrap().ino();
+            let file = File::options().read(true).write(true).open(&path).unwrap();
+            let flags = file.metadata().unwrap().st_flags();
+            set_flags(&file, flags | libc::UF_APPEND).unwrap();
+            assert!(!Publish.make_handler().publish(&mut staged).unwrap());
+            assert_eq!(path.metadata().unwrap().ino(), inode);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            set_flags(&file, flags).unwrap();
+            drop(file);
+            drop(staged);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn scratch_rechecks_source_changes_without_verification() {
+        for memory in [false, true] {
+            let input = TempDir::new().unwrap();
+            let scratch = TempDir::new().unwrap();
+            let path = input.path().join("file");
+            let (mut staged, mut original) =
+                stage_with_verify(&path, scratch.path(), memory, false);
+            original.push(b'b');
+            fs::write(&path, &original).unwrap();
+            let inode = path.metadata().unwrap().ino();
+            let error = Publish.make_handler().publish(&mut staged).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("source file changed after staging"));
+            assert_eq!(path.metadata().unwrap().ino(), inode);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            drop(staged);
+            assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
         }
     }
 

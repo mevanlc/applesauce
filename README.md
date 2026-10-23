@@ -70,6 +70,11 @@ applesauce info --summary path/to/first path/to/second
 
 Files that do not reach the compression threshold are skipped. Use `-v` /
 `--verbose` to report these skips, including with either scratch mode.
+Files with append-only, immutable, or other replacement-protecting macOS flags
+are also skipped. Before replacing a file, Applesauce rechecks its source
+identity and metadata. It also consults a periodically refreshed snapshot of
+open write handles. This check is best effort: a writer that opens after the
+snapshot, or one whose process cannot be inspected, may still be missed.
 
 ### Scratch storage for slower destinations
 

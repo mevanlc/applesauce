@@ -17,6 +17,7 @@ use tracing::warn;
 mod batching;
 pub mod compressing;
 pub mod reader;
+mod source_guard;
 pub mod writer;
 
 struct ThreadJoiner {
@@ -52,6 +53,7 @@ pub struct OperationContext {
     stats: Stats,
     finished_stats: crossbeam_channel::Sender<Stats>,
     volumes: Volumes,
+    open_writers: source_guard::OpenWriters,
     verify: bool,
     scratch: Option<Arc<Scratch>>,
 }
@@ -69,6 +71,7 @@ impl OperationContext {
             stats: Stats::default(),
             finished_stats,
             volumes,
+            open_writers: source_guard::OpenWriters::new(),
             verify,
             scratch,
         }
@@ -262,6 +265,12 @@ impl BackgroundThreads {
             }
             let mut file_info = info::get_file_info(&path, &metadata, &operation.volumes);
             stats.add_start_file(&metadata, &file_info);
+
+            if source_guard::is_protected(&metadata) {
+                progress.file_skipped(&path, SkipReason::ProtectedFlags);
+                stats.add_end_file(&metadata, &file_info);
+                return;
+            }
 
             let skip_reason: Option<SkipReason> = match &mut file_info.compression_state {
                 FileCompressionState::Compressed => {
