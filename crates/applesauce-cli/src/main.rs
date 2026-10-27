@@ -94,6 +94,9 @@ struct Decompress {
     verify: bool,
 
     #[command(flatten)]
+    hidden_options: HiddenOptions,
+
+    #[command(flatten)]
     scratch_options: ScratchOptions,
 }
 
@@ -142,6 +145,9 @@ struct Compress {
     /// original file.
     #[arg(long)]
     verify: bool,
+
+    #[command(flatten)]
+    hidden_options: HiddenOptions,
 
     #[command(flatten)]
     scratch_options: ScratchOptions,
@@ -208,6 +214,27 @@ impl Default for Backend {
             LzfseBackend::VendorUltra => Self::VendorUltra,
             _ => Self::Crate,
         }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+#[group(skip)]
+struct HiddenOptions {
+    /// Include files and directories whose names start with '.' (default)
+    #[arg(long, overrides_with_all = ["hidden", "no_hidden"])]
+    hidden: bool,
+
+    /// Skip files and directories whose names start with '.'
+    ///
+    /// Paths given on the command line are always processed.
+    /// When combined with --hidden, the last one wins.
+    #[arg(long, overrides_with_all = ["hidden", "no_hidden"])]
+    no_hidden: bool,
+}
+
+impl HiddenOptions {
+    fn skip_hidden(&self) -> bool {
+        self.no_hidden && !self.hidden
     }
 }
 
@@ -331,6 +358,9 @@ struct Info {
     /// Report a single summary across all paths
     #[arg(long)]
     summary: bool,
+
+    #[command(flatten)]
+    hidden_options: HiddenOptions,
 }
 
 #[derive(Debug, Copy, Clone, clap::ValueEnum, PartialEq, Eq)]
@@ -444,6 +474,7 @@ fn main() {
                 minimum_compression_ratio,
                 level,
                 verify,
+                hidden_options,
                 scratch_options,
                 ..
             } = options;
@@ -452,7 +483,9 @@ fn main() {
                 eprintln!("Warning: --level {level} has no effect for the selected encoder");
             }
 
-            let mut compressor = scratch_options.file_compressor();
+            let mut compressor = scratch_options
+                .file_compressor()
+                .skip_hidden(hidden_options.skip_hidden());
             let stats = compressor.recursive_compress(
                 paths.iter().map(Path::new),
                 encoder,
@@ -471,9 +504,12 @@ fn main() {
             paths,
             manual,
             verify,
+            hidden_options,
             scratch_options,
         }) => {
-            let mut compressor = scratch_options.file_compressor();
+            let mut compressor = scratch_options
+                .file_compressor()
+                .skip_hidden(hidden_options.skip_hidden());
             let stats = compressor.recursive_decompress(
                 paths.iter().map(Path::new),
                 manual,
@@ -486,11 +522,16 @@ fn main() {
                 display_stats(&stats, false);
             }
         }
-        Commands::Info(Info { paths, summary }) => {
+        Commands::Info(Info {
+            paths,
+            summary,
+            hidden_options,
+        }) => {
+            let skip_hidden = hidden_options.skip_hidden();
             if summary {
                 let mut summary_info = info::AfscFolderInfo::default();
                 for path in paths {
-                    match info::get_recursive_with_progress(&path, &progress_bars) {
+                    match info::get_recursive_with_progress(&path, &progress_bars, skip_hidden) {
                         Ok(path_info) => add_folder_info(&mut summary_info, &path_info),
                         Err(e) => tracing::error!(
                             "error reading compression info for {}: {}",
@@ -506,7 +547,8 @@ fn main() {
 
             for path in paths {
                 if path.is_dir() {
-                    let info = info::get_recursive_with_progress(&path, &progress_bars);
+                    let info =
+                        info::get_recursive_with_progress(&path, &progress_bars, skip_hidden);
                     let info = match info {
                         Ok(info) => info,
                         Err(e) => {
@@ -1150,6 +1192,33 @@ fn compression_summary_requires_two_quiet_flags_to_suppress() {
 
     let silent = Cli::try_parse_from(["applesauce", "compress", "-qq", "somefile"]).unwrap();
     assert!(!silent.show_compression_summary());
+}
+
+#[test]
+fn hidden_flags_last_one_wins() {
+    let parse = |args: &[&str]| {
+        let cli = Cli::try_parse_from(["applesauce"].iter().chain(args))
+            .expect("hidden flags should parse");
+        match cli.command {
+            Commands::Compress(compress) => compress.hidden_options.skip_hidden(),
+            Commands::Decompress(decompress) => decompress.hidden_options.skip_hidden(),
+            Commands::Info(info) => info.hidden_options.skip_hidden(),
+        }
+    };
+
+    assert!(!parse(&["compress", "somefile"]));
+    assert!(!parse(&["compress", "--hidden", "somefile"]));
+    assert!(parse(&["compress", "--no-hidden", "somefile"]));
+    assert!(!parse(&["compress", "--no-hidden", "--hidden", "somefile"]));
+    assert!(parse(&["compress", "--hidden", "--no-hidden", "somefile"]));
+    assert!(parse(&[
+        "decompress",
+        "--hidden",
+        "--no-hidden",
+        "somefile"
+    ]));
+    assert!(!parse(&["info", "--no-hidden", "--hidden", "somefile"]));
+    assert!(parse(&["info", "--no-hidden", "--no-hidden", "somefile"]));
 }
 
 #[test]

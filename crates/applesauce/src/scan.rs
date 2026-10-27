@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 fn walk_dir_over(
     path: &Path,
+    skip_hidden: bool,
     context: Arc<OperationContext>,
 ) -> jwalk::WalkDirGeneric<((), State)> {
-    let walker = jwalk::WalkDirGeneric::new(path);
+    let walker = jwalk::WalkDirGeneric::new(path).skip_hidden(skip_hidden);
     walker.process_read_dir(
         move |_depth,
               path: &Path,
@@ -48,13 +49,15 @@ type State = Option<Arc<times::Resetter>>;
 pub struct Walker<'a, P> {
     paths: Vec<&'a Path>,
     progress: &'a P,
+    skip_hidden: bool,
 }
 
 impl<'a, P: Progress + Send + Sync> Walker<'a, P> {
-    pub fn new(progress: &'a P) -> Self {
+    pub fn new(progress: &'a P, skip_hidden: bool) -> Self {
         Self {
             paths: Vec::new(),
             progress,
+            skip_hidden,
         }
     }
 
@@ -68,7 +71,7 @@ impl<'a, P: Progress + Send + Sync> Walker<'a, P> {
         mut f: impl FnMut(FileType, PathBuf, Option<Arc<times::Resetter>>) + Send + Sync,
     ) {
         for path in self.paths {
-            let walker = walk_dir_over(path, Arc::clone(context));
+            let walker = walk_dir_over(path, self.skip_hidden, Arc::clone(context));
             for entry in walker {
                 let mut entry = match entry {
                     Ok(entry) => entry,

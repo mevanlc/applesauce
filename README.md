@@ -68,6 +68,11 @@ To print one aggregate summary for multiple paths, run:
 applesauce info --summary path/to/first path/to/second
 ```
 
+Directories are walked recursively, including files and directories whose names
+start with `.`. Pass `--no-hidden` to `compress`, `decompress`, or `info` to skip
+them; paths given on the command line are still processed. `--hidden` restores
+the default, and when both are given the last one wins.
+
 Files that do not reach the compression threshold are skipped. Use `-v` /
 `--verbose` to report these skips, including with either scratch mode.
 Files with append-only, immutable, or other replacement-protecting macOS flags

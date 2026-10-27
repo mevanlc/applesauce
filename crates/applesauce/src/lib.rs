@@ -188,12 +188,23 @@ impl Stats {
 #[derive(Default)]
 pub struct FileCompressor {
     bg_threads: BackgroundThreads,
+    skip_hidden: bool,
 }
 
 impl FileCompressor {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Skip files and directories whose names start with `.` while walking directories.
+    ///
+    /// Hidden entries are included by default. Paths passed directly to an operation are
+    /// always processed, even when their own names start with `.`.
+    #[must_use]
+    pub fn skip_hidden(mut self, skip_hidden: bool) -> Self {
+        self.skip_hidden = skip_hidden;
+        self
     }
 
     /// Stage compression or decompression output in an existing directory before copying it to
@@ -273,6 +284,7 @@ impl FileCompressor {
                 target,
                 publishers,
             ),
+            skip_hidden: false,
         })
     }
 
@@ -299,6 +311,7 @@ impl FileCompressor {
             paths,
             progress,
             verify,
+            self.skip_hidden,
         )
     }
 
@@ -319,7 +332,8 @@ impl FileCompressor {
         } else {
             Mode::DecompressByReading
         };
-        self.bg_threads.scan(mode, paths, progress, verify)
+        self.bg_threads
+            .scan(mode, paths, progress, verify, self.skip_hidden)
     }
 }
 
@@ -495,7 +509,7 @@ mod tests {
         let new_contents = recursive_read(dir);
         assert_entries_equal(&old_contents, &new_contents);
 
-        let info = info::get_recursive(dir).unwrap();
+        let info = info::get_recursive(dir, false).unwrap();
         // These are very compressible files
         assert!(info.compression_savings_fraction() > 0.5);
 
@@ -539,7 +553,7 @@ mod tests {
         let new_contents = recursive_read(&path);
         assert_entries_equal(&contents, &new_contents);
 
-        let info = info::get_recursive(&path).unwrap();
+        let info = info::get_recursive(&path, false).unwrap();
         // These are very compressible files
         assert!(info.compression_savings_fraction() > 0.5);
     }
@@ -571,9 +585,74 @@ mod tests {
         let new_contents = recursive_read(outer_dir.path());
         assert_entries_equal(&contents, &new_contents);
 
-        let info = info::get_recursive(outer_dir.path()).unwrap();
+        let info = info::get_recursive(outer_dir.path(), false).unwrap();
         // These are very compressible files
         assert!(info.compression_savings_fraction() > 0.5);
+    }
+
+    #[test]
+    fn hidden_entries_are_included_unless_skipped() {
+        let is_compressed = |path: &Path| info::get(path).unwrap().is_compressed;
+        for skip_hidden in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let hidden_dir = dir.path().join(".hidden-dir");
+            fs::create_dir(&hidden_dir).unwrap();
+            let paths = [
+                dir.path().join("visible"),
+                dir.path().join(".hidden-file"),
+                hidden_dir.join("inner"),
+            ];
+            for path in &paths {
+                fs::write(path, [0; 16 * 1024]).unwrap();
+            }
+
+            FileCompressor::new()
+                .skip_hidden(skip_hidden)
+                .recursive_compress(
+                    iter::once(dir.path()),
+                    Kind::default(),
+                    1.0,
+                    5,
+                    &NoProgress,
+                    false,
+                );
+
+            assert!(is_compressed(&paths[0]));
+            assert_eq!(is_compressed(&paths[1]), !skip_hidden);
+            assert_eq!(is_compressed(&paths[2]), !skip_hidden);
+            assert_eq!(
+                info::get_recursive(dir.path(), skip_hidden)
+                    .unwrap()
+                    .num_files,
+                if skip_hidden { 1 } else { 3 }
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_hidden_paths_are_processed_when_skipping_hidden() {
+        let dir = TempDir::new().unwrap();
+        let hidden_dir = dir.path().join(".hidden-dir");
+        fs::create_dir(&hidden_dir).unwrap();
+        let inner = hidden_dir.join("inner");
+        let nested_hidden = hidden_dir.join(".nested");
+        let hidden_file = dir.path().join(".hidden-file");
+        for path in [&inner, &nested_hidden, &hidden_file] {
+            fs::write(path, [0; 16 * 1024]).unwrap();
+        }
+
+        FileCompressor::new().skip_hidden(true).recursive_compress(
+            [hidden_dir.as_path(), hidden_file.as_path()],
+            Kind::default(),
+            1.0,
+            5,
+            &NoProgress,
+            false,
+        );
+
+        assert!(info::get(&inner).unwrap().is_compressed);
+        assert!(info::get(&hidden_file).unwrap().is_compressed);
+        assert!(!info::get(&nested_hidden).unwrap().is_compressed);
     }
 
     #[cfg(feature = "zlib")]

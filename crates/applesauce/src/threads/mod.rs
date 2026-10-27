@@ -205,6 +205,7 @@ impl BackgroundThreads {
         paths: impl IntoIterator<Item = &'a Path>,
         progress: &P,
         verify: bool,
+        skip_hidden: bool,
     ) -> Stats
     where
         P: Progress + Send + Sync,
@@ -212,7 +213,7 @@ impl BackgroundThreads {
     {
         let (finished_stats, finished_stats_rx) = crossbeam_channel::bounded(1);
         let volumes = Volumes::new();
-        let mut walker = scan::Walker::new(progress);
+        let mut walker = scan::Walker::new(progress, skip_hidden);
         for path in paths {
             let Ok(metadata) = path.metadata() else {
                 continue;

@@ -103,13 +103,18 @@ impl AfscFolderInfo {
     }
 }
 
-pub fn get_recursive(path: &Path) -> io::Result<AfscFolderInfo> {
-    get_recursive_with(path, get)
+/// Walk `path`, optionally skipping entries whose names start with `.`.
+fn walk_dir(path: &Path, skip_hidden: bool) -> jwalk::WalkDir {
+    jwalk::WalkDir::new(path).skip_hidden(skip_hidden)
 }
 
-pub fn count_recursive_files(path: &Path) -> io::Result<u64> {
+pub fn get_recursive(path: &Path, skip_hidden: bool) -> io::Result<AfscFolderInfo> {
+    get_recursive_with(path, skip_hidden, get)
+}
+
+pub fn count_recursive_files(path: &Path, skip_hidden: bool) -> io::Result<u64> {
     let mut count = 0u64;
-    for entry in jwalk::WalkDir::new(path) {
+    for entry in walk_dir(path, skip_hidden) {
         let entry = entry?;
         #[allow(clippy::filetype_is_file)]
         if entry.file_type().is_file() && entry.metadata()?.nlink() <= 1 {
@@ -122,15 +127,16 @@ pub fn count_recursive_files(path: &Path) -> io::Result<u64> {
 pub fn get_recursive_with_progress<P: Progress + Sync>(
     path: &Path,
     progress: &P,
+    skip_hidden: bool,
 ) -> io::Result<AfscFolderInfo> {
-    get_recursive_with(path, |path| get_with_progress(path, progress))
+    get_recursive_with(path, skip_hidden, |path| get_with_progress(path, progress))
 }
 
-fn get_recursive_with<F>(path: &Path, get_file: F) -> io::Result<AfscFolderInfo>
+fn get_recursive_with<F>(path: &Path, skip_hidden: bool, get_file: F) -> io::Result<AfscFolderInfo>
 where
     F: Fn(&Path) -> io::Result<AfscFileInfo> + Sync,
 {
-    jwalk::WalkDir::new(path)
+    walk_dir(path, skip_hidden)
         .into_iter()
         .par_bridge()
         .try_fold(AfscFolderInfo::default, |mut result, entry| {
@@ -356,8 +362,8 @@ mod tests {
         .unwrap();
         let progress = CountingProgress::default();
 
-        assert_eq!(count_recursive_files(dir.path()).unwrap(), 2);
-        let info = get_recursive_with_progress(dir.path(), &progress).unwrap();
+        assert_eq!(count_recursive_files(dir.path(), false).unwrap(), 2);
+        let info = get_recursive_with_progress(dir.path(), &progress, false).unwrap();
         let expected_on_disk_size = get(&dir.path().join("one")).unwrap().on_disk_size
             + get(&dir.path().join("nested/two")).unwrap().on_disk_size;
 
